@@ -298,3 +298,43 @@ class TestDecodeHashRefresh:
         assert intent is not None
         assert intent.block_hashes == block_hashes[6:9]
         assert intent.group_block_ids == ((200, 201, 202),)
+
+    def test_hybrid_save_uses_common_suffix(self):
+        """Hybrid save maps common hash suffix into each group's local block list."""
+        sc = self._make_connector()
+        block_hashes = tuple(_hash(i) for i in range(6))
+
+        sc._block_hashes["r1"] = block_hashes
+        sc._block_index_offsets["r1"] = 0
+        sc._next_stored_block_idx["r1"] = 0
+        sc._scheduled_tokens["r1"] = 6 * 32
+        sc._allocated_blocks["r1"] = [
+            [10, 11, 12, 13, 14, 15],
+            [30, 31, 32],
+        ]
+
+        intent = sc._consume_save_intent("r1")
+
+        assert intent is not None
+        assert intent.block_hashes == block_hashes[3:6]
+        assert intent.group_block_ids == ((13, 14, 15), (30, 31, 32))
+
+    def test_external_hit_hybrid_save_uses_group_suffix_offsets(self):
+        """External-hit save maps global suffix indices into shorter SWA groups."""
+        sc = self._make_connector(dcp_world_size=1)
+        block_hashes = tuple(_hash(i) for i in range(9))
+
+        sc._block_hashes["r1"] = block_hashes
+        sc._block_index_offsets["r1"] = 6
+        sc._next_stored_block_idx["r1"] = 6
+        sc._scheduled_tokens["r1"] = 48
+        sc._allocated_blocks["r1"] = [
+            [100, 101, 102, 103, 104, 105, 200, 201, 202],
+            [300, 301, 302],
+        ]
+
+        intent = sc._consume_save_intent("r1")
+
+        assert intent is not None
+        assert intent.block_hashes == block_hashes[6:9]
+        assert intent.group_block_ids == ((200, 201, 202), (300, 301, 302))

@@ -359,40 +359,61 @@ class SchedulerConnector:
         # every KV cache group. Restrict saving to the common suffix that all
         # groups can still represent, instead of the longest group's history.
         common_blocks_in_groups = min((len(g) for g in allocated), default=0)
+        if common_blocks_in_groups <= 0:
+            return None
 
-        # Use virtual_block_size because block_hashes and allocated are both
-        # at the virtual block level (1 entry per pool block).
-        saveable = min(
-            len(block_hashes),
-            common_blocks_in_groups,
-            scheduled // self._ctx.virtual_block_size,
-        )
-        saveable_block_idx = min(len(block_hashes), base_block_idx + saveable)
-        new_blocks = saveable_block_idx - start_block_idx
+        # Use virtual_block_size because block_hashes are at the scheduler hash
+        # granularity. In external-hit cases, scheduled tokens are local-only,
+        # so add the first local block index tracked during allocation.
+        local_ready_blocks = scheduled // self._ctx.virtual_block_size
+        saveable_block_idx = min(len(block_hashes), base_block_idx + local_ready_blocks)
+
+        # KV cache groups with sliding/local attention keep only a suffix of
+        # the request. Save only the global hash range represented by every
+        # group, then map that global suffix back into each group's local list.
+        common_window_start = max(base_block_idx, saveable_block_idx - common_blocks_in_groups)
+        hash_start = max(start_block_idx, common_window_start)
+        new_blocks = saveable_block_idx - hash_start
         if new_blocks <= 0:
             return None
 
-        self._next_stored_block_idx[req_id] = saveable_block_idx
-        hash_start = start_block_idx
         save_hashes = block_hashes[hash_start : hash_start + new_blocks]
 
         logger.debug(
             "[PegaKVConnector] req=%s save_intent: start=%d hash_start=%d "
-            "base_block_idx=%d saveable_block_idx=%d new_blocks=%d "
-            "total_hashes=%d num_groups=%d",
+            "base_block_idx=%d common_window_start=%d saveable_block_idx=%d "
+            "new_blocks=%d total_hashes=%d num_groups=%d",
             req_id,
-            hash_start,
+            start_block_idx,
             hash_start,
             base_block_idx,
+            common_window_start,
             saveable_block_idx,
             new_blocks,
             len(block_hashes),
             len(allocated),
         )
 
-        group_block_ids = tuple(
-            tuple(g[hash_start : hash_start + new_blocks]) for g in allocated
-        )
+        group_block_id_lists: list[tuple[int, ...]] = []
+        for g in allocated:
+            group_global_start = saveable_block_idx - len(g)
+            group_slice_start = hash_start - group_global_start
+            group_slice_end = group_slice_start + new_blocks
+            if group_slice_start < 0 or group_slice_end > len(g):
+                logger.warning(
+                    "[PegaKVConnector] req=%s save_intent group slice out of range: "
+                    "hash_start=%d new_blocks=%d group_start=%d group_len=%d",
+                    req_id,
+                    hash_start,
+                    new_blocks,
+                    group_global_start,
+                    len(g),
+                )
+                return None
+            group_block_id_lists.append(tuple(g[group_slice_start:group_slice_end]))
+
+        group_block_ids = tuple(group_block_id_lists)
+        self._next_stored_block_idx[req_id] = saveable_block_idx
         return SaveIntent(
             group_block_ids=group_block_ids,
             block_hashes=save_hashes,

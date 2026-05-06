@@ -73,7 +73,7 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
             cross_layer_blocks=cross_layer_blocks,
         )
         num_layers = getattr(vllm_config.model_config.hf_text_config, "num_hidden_layers", 0)
-        block_size = vllm_config.cache_config.block_size
+        block_size = _resolve_connector_block_size(vllm_config, kv_cache_config)
 
         tp_rank: int | None = None
         device_id: int | None = None
@@ -358,6 +358,35 @@ def _resolve_device_id() -> int:
         return int(mapped)
     except ValueError:
         return local_id
+
+
+def _resolve_connector_block_size(vllm_config, kv_cache_config) -> int:
+    """Resolve the block/hash granularity PegaFlow can safely use.
+
+    PegaFlow connector metadata currently assumes request.block_hashes and
+    physical block ids are 1:1 for every KV cache group. vLLM 0.20 added
+    heterogeneous group block sizes with finer hash granularity; that needs a
+    per-group hash mapping before it can be supported safely.
+    """
+    fallback = vllm_config.cache_config.block_size
+    groups = getattr(kv_cache_config, "kv_cache_groups", None) or []
+    if not groups:
+        return fallback
+
+    group_block_sizes: list[int] = []
+    for group in groups:
+        spec = getattr(group, "kv_cache_spec", None)
+        group_block_sizes.append(getattr(spec, "block_size", fallback))
+
+    if len(set(group_block_sizes)) > 1:
+        raise ValueError(
+            "PegaKVConnector does not support heterogeneous KV cache group "
+            f"block sizes yet: {group_block_sizes}. vLLM 0.20+ may use finer "
+            "request.block_hashes than physical group blocks; refusing to "
+            "avoid corrupt save/load hash mappings."
+        )
+
+    return group_block_sizes[0]
 
 
 __all__ = ["PegaKVConnector", "KVConnectorRole"]
