@@ -61,6 +61,7 @@ pub(crate) struct PinnedMemoryPool {
     /// Backing pinned memory (handles mmap + cudaHostRegister)
     backing: PinnedMemory,
     allocator: Mutex<ScaledOffsetAllocator>,
+    allocatable_bytes: u64,
 }
 
 impl PinnedMemoryPool {
@@ -111,21 +112,24 @@ impl PinnedMemoryPool {
 
         let actual_size = backing.size() as u64;
         let unit_size = Self::compute_unit_size(actual_size, unit_size_hint);
+        let max_units = actual_size / unit_size;
+        let allocatable_bytes = max_units * unit_size;
 
         info!(
-            "Pinned pool: size={}, unit_size={}, max_units={}",
+            "Pinned pool: backing_size={}, unit_size={}, max_units={}, allocatable_size={}",
             ByteSize(actual_size),
             ByteSize(unit_size),
-            actual_size.div_ceil(unit_size)
+            max_units,
+            ByteSize(allocatable_bytes)
         );
 
         let metrics = core_metrics();
-        if let Ok(capacity_i64) = i64::try_from(actual_size) {
+        if let Ok(capacity_i64) = i64::try_from(allocatable_bytes) {
             metrics.pool_capacity_bytes.add(capacity_i64, &[]);
         } else {
             error!(
-                "Pinned pool capacity exceeds i64::MAX; skipping capacity metric update: capacity_bytes={}",
-                actual_size
+                "Pinned pool capacity exceeds i64::MAX; skipping capacity metric update: allocatable_bytes={}",
+                allocatable_bytes
             );
         }
 
@@ -146,6 +150,7 @@ impl PinnedMemoryPool {
         Self {
             backing,
             allocator: Mutex::new(allocator),
+            allocatable_bytes,
         }
     }
 
@@ -170,14 +175,21 @@ impl PinnedMemoryPool {
             }
         };
 
-        let offset: usize = allocation
-            .offset_bytes
-            .try_into()
-            .expect("allocation offset exceeds usize");
+        let size_bytes = allocation.size_bytes.get();
+        let backing_size = self.backing.size() as u64;
+        let allocation_end = allocation.offset_bytes.checked_add(size_bytes);
+        assert!(
+            matches!(allocation_end, Some(end) if end <= backing_size),
+            "pinned allocator returned allocation outside backing memory: offset={} size={} backing_size={}",
+            allocation.offset_bytes,
+            size_bytes,
+            backing_size
+        );
+
+        let offset = allocation.offset_bytes as usize;
         let ptr = unsafe { self.backing.as_ptr().add(offset) };
         let ptr = NonNull::new(ptr as *mut u8).expect("PinnedMemoryPool returned null pointer");
 
-        let size_bytes = allocation.size_bytes.get();
         if let Ok(size_i64) = i64::try_from(size_bytes) {
             core_metrics().pool_used_bytes.add(size_i64, &[]);
         }
@@ -231,13 +243,12 @@ impl PinnedMemoryPool {
 impl Drop for PinnedMemoryPool {
     fn drop(&mut self) {
         let metrics = core_metrics();
-        let capacity_bytes = self.backing.size();
-        if let Ok(capacity_i64) = i64::try_from(capacity_bytes) {
+        if let Ok(capacity_i64) = i64::try_from(self.allocatable_bytes) {
             metrics.pool_capacity_bytes.add(-capacity_i64, &[]);
         } else {
             error!(
-                "Pinned pool capacity exceeds i64::MAX; skipping capacity metric cleanup: capacity_bytes={}",
-                capacity_bytes
+                "Pinned pool capacity exceeds i64::MAX; skipping capacity metric cleanup: allocatable_bytes={}",
+                self.allocatable_bytes
             );
         }
     }
@@ -478,6 +489,17 @@ impl NumaAwarePinnedPools {
         self.pools.get(&numa_node.0)?.allocate(size).map(Arc::new)
     }
 
+    /// Largest contiguous free region for a specific NUMA node.
+    fn largest_free_allocation_for_node(&self, numa_node: NumaNode) -> u64 {
+        if numa_node.is_unknown() {
+            return 0;
+        }
+        self.pools
+            .get(&numa_node.0)
+            .map(|pool| pool.largest_free_allocation())
+            .unwrap_or(0)
+    }
+
     /// Return all backing memory regions across all NUMA nodes and shards.
     fn memory_regions(&self) -> Vec<(NonNull<u8>, usize)> {
         self.pools
@@ -585,18 +607,14 @@ impl PinnedAllocator {
         }
     }
 
-    /// Get the largest contiguous free region available.
+    /// Largest contiguous free region for the requested allocation target.
     ///
-    /// For NUMA allocators, returns the minimum largest free region across all nodes.
-    pub(crate) fn largest_free_allocation(&self) -> u64 {
+    /// For global allocators, `numa_node` is ignored.
+    /// For NUMA allocators, this checks only the target node's pool.
+    pub(crate) fn largest_free_allocation_for_node(&self, numa_node: NumaNode) -> u64 {
         match self {
             Self::Global(pool) => pool.largest_free_allocation(),
-            Self::Numa(pools) => pools
-                .pools
-                .values()
-                .map(|p| p.largest_free_allocation())
-                .min()
-                .unwrap_or(0),
+            Self::Numa(pools) => pools.largest_free_allocation_for_node(numa_node),
         }
     }
 
@@ -618,3 +636,57 @@ impl PinnedAllocator {
 // both of which are Send + Sync.
 unsafe impl Send for PinnedAllocator {}
 unsafe impl Sync for PinnedAllocator {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn numa_largest_free_for_node_is_not_global_min() {
+        let mut pools = HashMap::new();
+        pools.insert(
+            0,
+            ShardedPinnedPool::new(4096, 1, false, false, NonZeroU64::new(512)),
+        );
+        pools.insert(
+            1,
+            ShardedPinnedPool::new(4096, 1, false, false, NonZeroU64::new(512)),
+        );
+        let allocator = PinnedAllocator::Numa(NumaAwarePinnedPools { pools });
+
+        let pinned = match &allocator {
+            PinnedAllocator::Numa(pools) => pools.pools.get(&0).unwrap(),
+            _ => unreachable!(),
+        };
+        let _held = pinned.allocate(NonZeroU64::new(3584).unwrap()).unwrap();
+
+        let global_min = match &allocator {
+            PinnedAllocator::Numa(pools) => pools
+                .pools
+                .values()
+                .map(|p| p.largest_free_allocation())
+                .min()
+                .unwrap_or(0),
+            _ => unreachable!(),
+        };
+        let node1_largest = allocator.largest_free_allocation_for_node(NumaNode(1));
+
+        assert_eq!(global_min, 512);
+        assert_eq!(node1_largest, 4096);
+    }
+
+    #[test]
+    fn numa_largest_free_for_unknown_node_is_zero() {
+        let mut pools = HashMap::new();
+        pools.insert(
+            0,
+            ShardedPinnedPool::new(4096, 1, false, false, NonZeroU64::new(512)),
+        );
+        let allocator = PinnedAllocator::Numa(NumaAwarePinnedPools { pools });
+
+        assert_eq!(
+            allocator.largest_free_allocation_for_node(NumaNode::UNKNOWN),
+            0
+        );
+    }
+}

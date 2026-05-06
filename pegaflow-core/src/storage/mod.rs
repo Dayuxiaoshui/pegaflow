@@ -268,9 +268,13 @@ impl StorageEngine {
             }
 
             let (freed_blocks, _freed_bytes, largest_free) =
-                self.reclaim_until_allocator_can_allocate(requested_bytes);
+                self.reclaim_until_allocator_can_allocate(requested_bytes, node);
 
-            if freed_blocks == 0 || largest_free < requested_bytes {
+            if freed_blocks == 0 && largest_free < requested_bytes {
+                // Final retry: absorb concurrent frees that may have raced with reclaim probing.
+                if let Some(alloc) = self.allocator.allocate(size, node) {
+                    return Some(alloc);
+                }
                 break;
             }
         }
@@ -371,14 +375,22 @@ impl StorageEngine {
             .await
     }
 
-    fn reclaim_until_allocator_can_allocate(&self, required_bytes: u64) -> (usize, u64, u64) {
+    fn reclaim_until_allocator_can_allocate(
+        &self,
+        required_bytes: u64,
+        target_node: NumaNode,
+    ) -> (usize, u64, u64) {
         if required_bytes == 0 {
-            return (0, 0, self.allocator.largest_free_allocation());
+            return (
+                0,
+                0,
+                self.allocator.largest_free_allocation_for_node(target_node),
+            );
         }
 
         let mut freed_blocks = 0usize;
         let mut freed_bytes = 0u64;
-        let mut largest_free = self.allocator.largest_free_allocation();
+        let mut largest_free = self.allocator.largest_free_allocation_for_node(target_node);
 
         while largest_free < required_bytes {
             let used_before = self.allocator.usage().0;
@@ -387,6 +399,15 @@ impl StorageEngine {
 
             if evicted.is_empty() {
                 break;
+            }
+
+            // Notify MetaServer that evicted blocks are no longer available for RDMA fetch.
+            if let Some(client) = &self.metaserver_client {
+                let entries: Vec<(String, Vec<u8>)> = evicted
+                    .iter()
+                    .map(|(key, _)| (key.namespace.clone(), key.hash.clone()))
+                    .collect();
+                client.try_unregister(entries);
             }
 
             let mut batch_bytes = 0u64;
@@ -418,7 +439,7 @@ impl StorageEngine {
                     .add(reclaimed, &[]);
             }
 
-            largest_free = self.allocator.largest_free_allocation();
+            largest_free = self.allocator.largest_free_allocation_for_node(target_node);
         }
 
         if freed_blocks > 0 {
@@ -438,14 +459,21 @@ impl StorageEngine {
         (freed_blocks, freed_bytes, largest_free)
     }
 
-    /// Remove stale inflight blocks older than `max_age`.
-    pub(crate) async fn gc_stale_inflight(&self, max_age: std::time::Duration) -> usize {
-        let cleaned = self.write_pipeline.gc_stale_inflight(max_age).await;
-        let failed = self.prefetch.gc_failed_remote(max_age);
+    /// Remove stale inflight blocks and failed_remote entries.
+    pub(crate) async fn gc_stale_inflight(
+        &self,
+        inflight_max_age: std::time::Duration,
+        failed_remote_max_age: std::time::Duration,
+    ) -> (usize, usize) {
+        let cleaned = self
+            .write_pipeline
+            .gc_stale_inflight(inflight_max_age)
+            .await;
+        let failed = self.prefetch.gc_failed_remote(failed_remote_max_age);
         if failed > 0 {
             log::debug!("gc: cleared {failed} stale failed_remote entries");
         }
-        cleaned + failed
+        (cleaned, failed)
     }
 
     // ---- Cross-node transfer: serving side ----
@@ -589,10 +617,14 @@ mod tests {
     #[tokio::test]
     async fn gc_stale_inflight_returns_zero_when_empty() {
         let storage = make_engine();
-        let cleaned = storage
-            .gc_stale_inflight(std::time::Duration::from_secs(60))
+        let (cleaned, failed) = storage
+            .gc_stale_inflight(
+                std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(60),
+            )
             .await;
         assert_eq!(cleaned, 0);
+        assert_eq!(failed, 0);
     }
 
     #[tokio::test]

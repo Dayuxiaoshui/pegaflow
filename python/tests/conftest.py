@@ -13,6 +13,7 @@ import socket
 import subprocess
 import sys
 import sysconfig
+import tempfile
 import time
 import uuid
 from collections.abc import Generator
@@ -323,6 +324,8 @@ class PegaServerProcess:
         self.endpoint = f"http://127.0.0.1:{port}"
         self.process: subprocess.Popen | None = None
         self._binary_path = find_server_binary()
+        self._log_path: Path | None = None
+        self._log_file = None
 
     def start(self) -> bool:
         """Start the server process. Returns True if successful."""
@@ -331,6 +334,7 @@ class PegaServerProcess:
 
         env = os.environ.copy()
         env["PYO3_PYTHON"] = sys.executable
+        env["PYTHONHOME"] = sys.base_prefix
 
         # Add libpython to LD_LIBRARY_PATH if available
         if libdir := sysconfig.get_config_var("LIBDIR"):
@@ -347,20 +351,29 @@ class PegaServerProcess:
             f"127.0.0.1:{self.port}",
             "--pool-size",
             self.pool_size,
-            "--device",
+            "--devices",
             "0",
         ]
+
+        # Route logs to a tempfile so the pipe buffer cannot fill up and
+        # block the server mid-startup, and so tests can read the log
+        # contents via read_logs() (used by integration tests that assert
+        # on server-side log signals).
+        fd, path = tempfile.mkstemp(prefix=f"pega-server-{self.port}-", suffix=".log")
+        self._log_path = Path(path)
+        self._log_file = os.fdopen(fd, "wb")
 
         try:
             self.process = subprocess.Popen(
                 cmd,
                 env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=self._log_file,
+                stderr=subprocess.STDOUT,
                 cwd="/tmp",
-                preexec_fn=os.setsid if sys.platform != "win32" else None,
+                preexec_fn=os.setsid,
             )
         except (FileNotFoundError, PermissionError):
+            self._close_log()
             return False
 
         return wait_for_server_ready(self.endpoint)
@@ -368,26 +381,39 @@ class PegaServerProcess:
     def stop(self) -> None:
         """Stop the server process."""
         if self.process is None:
+            self._close_log()
             return
         try:
-            if sys.platform != "win32":
-                os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
-            else:
-                self.process.terminate()
+            os.killpg(os.getpgid(self.process.pid), signal.SIGTERM)
             self.process.wait(timeout=5)
         except (subprocess.TimeoutExpired, ProcessLookupError, OSError):
             if self.process:
-                if sys.platform != "win32":
-                    os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
-                else:
-                    self.process.kill()
+                os.killpg(os.getpgid(self.process.pid), signal.SIGKILL)
                 self.process.wait(timeout=2)
         finally:
             self.process = None
+            self._close_log()
 
     def is_running(self) -> bool:
         """Check if server process is still running."""
         return self.process is not None and self.process.poll() is None
+
+    def read_logs(self) -> str:
+        """Return current server log contents (stdout + stderr merged)."""
+        if not self._log_path or not self._log_path.exists():
+            return ""
+        return self._log_path.read_text(errors="replace")
+
+    def _close_log(self) -> None:
+        import contextlib
+
+        if self._log_file is not None:
+            with contextlib.suppress(OSError):
+                self._log_file.close()
+            self._log_file = None
+        if self._log_path and self._log_path.exists():
+            with contextlib.suppress(OSError):
+                self._log_path.unlink()
 
 
 @pytest.fixture(scope="session")
@@ -467,6 +493,41 @@ def registered_instance(client_context: ClientContext) -> Generator[str, None, N
 
 
 # =============================================================================
+# Fixtures: E2E / Fuzz shared options
+# =============================================================================
+
+
+@pytest.fixture(scope="module")
+def model(request) -> str:
+    return request.config.getoption("--model")
+
+
+@pytest.fixture(scope="module")
+def base_port(request) -> int:
+    return request.config.getoption("--e2e-port")
+
+
+@pytest.fixture(scope="module")
+def pega_metrics_port(request) -> int:
+    return request.config.getoption("--pega-metrics-port")
+
+
+@pytest.fixture(scope="module")
+def tensor_parallel_size(request) -> int:
+    return request.config.getoption("--tensor-parallel-size")
+
+
+@pytest.fixture(scope="module")
+def pipeline_parallel_size(request) -> int:
+    return request.config.getoption("--pipeline-parallel-size")
+
+
+@pytest.fixture(scope="module")
+def max_model_len(request) -> int | None:
+    return request.config.getoption("--max-model-len")
+
+
+# =============================================================================
 # Pytest Configuration
 # =============================================================================
 
@@ -506,6 +567,13 @@ def pytest_addoption(parser):
         default=1,
         type=int,
         help="Pipeline parallel size for vLLM servers in E2E/Fuzz tests (tp * pp <= 4)",
+    )
+    parser.addoption(
+        "--max-model-len",
+        action="store",
+        default=None,
+        type=int,
+        help="Max model length for vLLM servers (e.g. 16384 for large models on small GPUs)",
     )
     # Fuzz test options
     parser.addoption(

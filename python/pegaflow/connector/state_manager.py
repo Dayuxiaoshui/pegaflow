@@ -1,8 +1,9 @@
 """
 Simple service state management for PegaFlow connector fault tolerance.
 
-When Query fails, marks service unavailable and starts health check.
-All operations bypass connector until service recovers.
+Current implementation scope:
+- scheduler query path can bypass remote lookup while service is unavailable
+- worker load/save paths do not consult this state
 """
 
 import threading
@@ -22,7 +23,7 @@ class ServiceStateManager:
     Simple service state manager with health checking.
 
     When service becomes unavailable:
-    - Query bypass the connector
+    - Scheduler query bypasses remote lookup
     - Background thread checks health periodically
     - Service recovers when health check passes
     """
@@ -68,7 +69,7 @@ class ServiceStateManager:
             name="PegaHealthCheck",
         )
         self._thread.start()
-        logger.info(
+        logger.debug(
             "[PegaKVConnector] Started health check (interval=%.1fs)",
             self._interval,
         )
@@ -86,7 +87,7 @@ class ServiceStateManager:
                 if ok:
                     with self._lock:
                         self._available = True
-                    logger.info("[PegaKVConnector] Service recovered")
+                    logger.debug("[PegaKVConnector] Service recovered")
                     return
             except Exception as e:
                 logger.debug("[PegaKVConnector] Health check failed: %s", e)

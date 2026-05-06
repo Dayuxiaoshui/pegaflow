@@ -14,7 +14,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorRole,
     SupportsHMA,
 )
-from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
+from vllm.distributed.parallel_state import get_pp_group, get_tensor_model_parallel_rank
 
 from pegaflow.connector.common import (
     ConnectorContext,
@@ -78,8 +78,12 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
         tp_rank: int | None = None
         device_id: int | None = None
         dcp_rank: int = 0
+        pp_rank: int = 0
+        pp_size: int = getattr(vllm_config.parallel_config, "pipeline_parallel_size", 1) or 1
         if role == KVConnectorRole.WORKER:
             tp_rank = get_tensor_model_parallel_rank()
+            pp_group = get_pp_group()
+            pp_rank = pp_group.rank_in_group
             if dcp_world_size > 1:
                 from vllm.distributed.parallel_state import (
                     get_decode_context_model_parallel_rank,
@@ -100,7 +104,7 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
         ) or vllm_config.kv_transfer_config.get_from_extra_config("pegaflow.port", 50055)
         self._engine_endpoint = f"{server_host}:{server_port}"
         engine_client = EngineRpcClient(self._engine_endpoint)
-        logger.info("[PegaKVConnector] Connected to engine server at %s", self._engine_endpoint)
+        logger.debug("[PegaKVConnector] Connected to engine server at %s", self._engine_endpoint)
 
         self._state_manager = ServiceStateManager(engine_client)
 
@@ -119,24 +123,34 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
             dcp_world_size=dcp_world_size,
             pcp_world_size=pcp_world_size,
             dcp_rank=dcp_rank,
+            pp_rank=pp_rank,
+            pp_size=pp_size,
         )
 
         self._scheduler: SchedulerConnector | None = None
         self._worker: WorkerConnector | None = None
         if role == KVConnectorRole.SCHEDULER:
             self._scheduler = SchedulerConnector(self._ctx, kv_cache_config)
+            # Open the liveness stream from the scheduler process only. One
+            # stream per vllm replica is enough - if any tp worker crashes,
+            # the scheduler dies too, closing this stream and triggering
+            # server-side cleanup of the instance's CUDA IPC mappings.
+            engine_client.start_session_watcher(instance_id, namespace, tp_size, world_size)
         else:
             self._worker = WorkerConnector(self._ctx)
 
-        logger.info(
+        logger.debug(
             "[PegaKVConnector] Initialized role=%s instance_id=%s device=%s "
-            "tp_rank=%s tp_size=%d world_size=%d engine_world_size=%d num_kv_groups=%d layers=%d namespace=%s "
+            "tp_rank=%s tp_size=%d pp_rank=%d pp_size=%d world_size=%d "
+            "engine_world_size=%d num_kv_groups=%d layers=%d namespace=%s "
             "is_mla=%s dcp_world_size=%d pcp_world_size=%d dcp_rank=%d",
             role.name,
             instance_id,
             device_id if device_id is not None else "cpu",
             tp_rank if tp_rank is not None else "N/A",
             tp_size,
+            pp_rank,
+            pp_size,
             world_size,
             engine_world_size,
             num_kv_groups,
@@ -171,12 +185,10 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
         attn_metadata,
         **kwargs: Any,
     ) -> None:
-        if not self._worker:
-            return
-        metadata = self._get_connector_metadata()
-        if metadata is None:
-            return
-        self._worker.save_kv_layer(metadata, layer_name, kv_layer, attn_metadata, **kwargs)
+        # Save is submitted from wait_for_save() using scheduler metadata.
+        # Layer callbacks are intentionally ignored so CUDA graph replay
+        # cannot suppress save submission.
+        pass
 
     def wait_for_save(self) -> None:
         if not self._worker:
@@ -263,7 +275,9 @@ class PegaKVConnector(KVConnectorBase_V1, SupportsHMA):
     # Defaults and shutdown
     # ==============================
     def get_block_ids_with_load_errors(self) -> set[int]:
-        return set()
+        if not self._worker:
+            return set()
+        return self._worker.get_block_ids_with_load_errors()
 
     def get_kv_connector_stats(self) -> PegaKVConnectorStats | None:
         stats: PegaKVConnectorStats | None = None

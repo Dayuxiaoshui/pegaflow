@@ -114,6 +114,20 @@ message HealthResponse {
   ResponseStatus status = 1;
 }
 
+// Liveness session: vllm opens a server-streaming RPC at startup and holds
+// it for the lifetime of the instance. Server detects client disconnect
+// (process death → TCP FIN) and auto-releases the instance's CUDA IPC
+// mappings. Stream events are reserved for future server→client hints.
+message SessionRequest {
+  string instance_id = 1;
+  string namespace   = 2;
+  uint32 tp_size     = 3;
+  uint32 world_size  = 4;
+}
+
+message SessionEvent {
+}
+
 // Cross-node transfer: per-slot RDMA metadata
 message TransferSlotInfo {
   uint64 k_ptr = 1;      // Remote pinned memory address for K segment
@@ -180,6 +194,9 @@ service Engine {
   rpc RdmaHandshake(RdmaHandshakeRequest) returns (RdmaHandshakeResponse);
   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
   rpc Health(HealthRequest) returns (HealthResponse);
+  // Liveness channel: server drops the instance's CUDA IPC mappings when
+  // this stream closes (vllm process dies or disconnects).
+  rpc Session(SessionRequest) returns (stream SessionEvent);
 }
 
 // MetaServer service for managing block hash keys across multi-node instances
@@ -193,6 +210,19 @@ message InsertBlockHashesRequest {
 message InsertBlockHashesResponse {
   ResponseStatus status = 1;
   uint64 inserted_count = 2;
+}
+
+message RemoveBlockHashesRequest {
+  string namespace = 1;
+  repeated bytes block_hashes = 2;
+  // Only remove entries whose current owner matches this node address.
+  // Prevents races where node A evicts but node B has since re-registered.
+  string node = 3;
+}
+
+message RemoveBlockHashesResponse {
+  ResponseStatus status = 1;
+  uint64 removed_count = 2;
 }
 
 message QueryPrefixBlocksRequest {
@@ -211,7 +241,6 @@ message QueryPrefixBlocksResponse {
 
 service MetaServer {
   rpc InsertBlockHashes(InsertBlockHashesRequest) returns (InsertBlockHashesResponse);
+  rpc RemoveBlockHashes(RemoveBlockHashesRequest) returns (RemoveBlockHashesResponse);
   rpc QueryPrefixBlocks(QueryPrefixBlocksRequest) returns (QueryPrefixBlocksResponse);
-  rpc Health(HealthRequest) returns (HealthResponse);
-  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
 }
