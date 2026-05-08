@@ -310,6 +310,8 @@ class PegaKVConnector(KVConnectorBase_V1):
         return None
 
     def shutdown(self):
+        if self._scheduler:
+            self._scheduler.shutdown()
         if self._worker:
             self._worker.shutdown()
         if self._state_manager:

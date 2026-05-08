@@ -343,15 +343,20 @@ impl StorageEngine {
             .consume_pinned_blocks(instance_id, namespace, block_hashes)
     }
 
-    /// Unpin blocks (cancellation path before consume).
-    pub(crate) fn unpin_blocks(
+    /// Unpin multiple refs for each block hash in one cancellation operation.
+    pub(crate) fn unpin_block_refs(
         &self,
         instance_id: &str,
         namespace: &str,
         block_hashes: &[Vec<u8>],
+        release_refs_per_hash: usize,
     ) -> usize {
-        self.read_cache
-            .unpin_blocks(instance_id, namespace, block_hashes)
+        self.read_cache.unpin_block_refs(
+            instance_id,
+            namespace,
+            block_hashes,
+            release_refs_per_hash,
+        )
     }
 
     /// Check prefix blocks and schedule backing-store reads if needed.
@@ -593,13 +598,30 @@ mod tests {
         assert_eq!(storage.test_pin_count("inst1", &key), 2);
 
         // Unpin once (simulating one worker cancellation)
-        let unpinned = storage.unpin_blocks("inst1", "ns", &[vec![1]]);
+        let unpinned = storage.unpin_block_refs("inst1", "ns", &[vec![1]], 1);
         assert_eq!(unpinned, 1);
         assert_eq!(storage.test_pin_count("inst1", &key), 1);
 
         // Unpin again
-        let unpinned = storage.unpin_blocks("inst1", "ns", &[vec![1]]);
+        let unpinned = storage.unpin_block_refs("inst1", "ns", &[vec![1]], 1);
         assert_eq!(unpinned, 1);
+        assert_eq!(storage.test_pin_count("inst1", &key), 0);
+    }
+
+    #[tokio::test]
+    async fn unpin_block_refs_releases_multiple_worker_refs() {
+        let storage = make_engine();
+        let key = BlockKey::new("ns".into(), vec![1]);
+        let block = Arc::new(SealedBlock::from_slots(Vec::new()));
+
+        storage.test_insert_cache(key.clone(), block.clone());
+        storage
+            .read_cache
+            .pin_blocks("inst1", 3, &[(key.clone(), block)]);
+        assert_eq!(storage.test_pin_count("inst1", &key), 3);
+
+        let unpinned = storage.unpin_block_refs("inst1", "ns", &[vec![1]], 3);
+        assert_eq!(unpinned, 3);
         assert_eq!(storage.test_pin_count("inst1", &key), 0);
     }
 

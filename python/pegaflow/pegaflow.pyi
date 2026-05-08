@@ -203,6 +203,7 @@ class EngineRpcClient:
         self,
         instance_id: str,
         block_hashes: list[bytes],
+        release_refs_per_hash: int,
     ) -> tuple[bool, str]:
         """Unpin blocks that were pinned during query.
 
@@ -212,6 +213,7 @@ class EngineRpcClient:
         Args:
             instance_id: Model instance ID.
             block_hashes: List of block hashes to unpin.
+            release_refs_per_hash: Number of pin refs to release for each hash.
 
         Returns:
             Tuple of (ok, message) indicating success/failure.

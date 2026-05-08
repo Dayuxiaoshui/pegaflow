@@ -90,6 +90,8 @@ message QueryResponse {
 message UnpinRequest {
   string instance_id = 1;
   repeated bytes block_hashes = 2;
+  // Number of pin refs to release for each block hash. Must be >= 1.
+  uint32 release_refs_per_hash = 3;
 }
 
 message UnpinResponse {

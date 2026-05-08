@@ -4,6 +4,7 @@ Scheduler-side connector logic.
 
 import time
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from pegaflow.connector.common import (
@@ -23,6 +24,18 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
+
+
+@dataclass(frozen=True)
+class _PendingQueryProbe:
+    computed_blocks: int
+    remaining_hashes: tuple[bytes, ...]
+    hit_blocks: int
+    release_refs_per_hash: int
+
+    @property
+    def pinned_hashes(self) -> tuple[bytes, ...]:
+        return self.remaining_hashes[: self.hit_blocks]
 
 
 class SchedulerConnector:
@@ -45,6 +58,8 @@ class SchedulerConnector:
         # Load state
         self._pending_load_intents: dict[str, LoadIntent] = {}
         self._prefetch_start_times: dict[str, float] = {}
+        self._pending_query_probes: dict[str, _PendingQueryProbe] = {}
+        self._pending_query_probe_releases: dict[str, _PendingQueryProbe] = {}
 
         # Prefetch tracking (for metrics and bypass decisions)
         self._prefetch_tracker = PrefetchTracker()
@@ -77,6 +92,9 @@ class SchedulerConnector:
         num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
         req_id = request.request_id
+        if not self._drain_pending_query_probe_releases(req_id):
+            return (None, False)
+
         num_tokens = request.num_tokens
         block_hashes = request.block_hashes
 
@@ -88,6 +106,8 @@ class SchedulerConnector:
         remaining_hashes = block_hashes[computed_blocks:]
 
         if not remaining_hashes:
+            if not self._release_pending_query_probe(req_id):
+                return (None, False)
             self._external_matched_blocks[req_id] = computed_blocks
             return (0, False)
 
@@ -98,6 +118,8 @@ class SchedulerConnector:
         if num_remaining_blocks < self.BYPASS_BLOCKS and pending >= self.HIGH_LOAD_THRESHOLD:
             self._external_matched_blocks[req_id] = computed_blocks
             self._bypass_count += 1
+            if not self._release_pending_query_probe(req_id):
+                return (None, False)
             logger.debug(
                 "[PegaKVConnector] req=%s bypass: remaining_blocks=%d "
                 "pending_prefetches=%d bypass_count=%d",
@@ -108,6 +130,31 @@ class SchedulerConnector:
             )
             return (0, False)
 
+        remaining_hashes_tuple = tuple(remaining_hashes)
+        pending_probe = self._pending_query_probes.get(req_id)
+        if (
+            pending_probe is not None
+            and pending_probe.computed_blocks == computed_blocks
+            and pending_probe.remaining_hashes == remaining_hashes_tuple
+        ):
+            hit_blocks = pending_probe.hit_blocks
+            self._external_matched_blocks[req_id] = computed_blocks + hit_blocks
+            num_hit_tokens = hit_blocks * self._ctx.virtual_block_size
+            logger.info(
+                "[PegaKVConnector] req=%s cache_lookup_reuse: hit_blocks=%d "
+                "computed_blocks=%d hit_tokens=%d num_tokens=%d total_query_hashes=%d",
+                req_id,
+                hit_blocks,
+                computed_blocks,
+                num_hit_tokens,
+                num_tokens,
+                len(remaining_hashes),
+            )
+            return (num_hit_tokens, True)
+
+        if pending_probe is not None and not self._release_pending_query_probe(req_id):
+            return (None, False)
+
         lookup_start = time.perf_counter()
         hit_blocks = self._count_available_block_prefix(remaining_hashes, req_id)
         lookup_end = time.perf_counter()
@@ -117,12 +164,20 @@ class SchedulerConnector:
         if hit_blocks is None:
             return (None, False)
 
+        if hit_blocks > 0:
+            self._pending_query_probes[req_id] = _PendingQueryProbe(
+                computed_blocks=computed_blocks,
+                remaining_hashes=remaining_hashes_tuple,
+                hit_blocks=hit_blocks,
+                release_refs_per_hash=max(1, self._ctx.world_size),
+            )
+
         self._external_matched_blocks[req_id] = computed_blocks + hit_blocks
 
         # Each hit block = 1 virtual block = virtual_block_size global tokens.
         num_hit_tokens = hit_blocks * self._ctx.virtual_block_size
 
-        logger.debug(
+        logger.info(
             "[PegaKVConnector] req=%s cache_lookup: hit_blocks=%d computed_blocks=%d "
             "hit_tokens=%d num_tokens=%d lookup_us=%.0f total_query_hashes=%d",
             req_id,
@@ -185,7 +240,15 @@ class SchedulerConnector:
                 ),
                 num_tokens=num_external_tokens,
             )
+            pending_probe = self._pending_query_probes.get(req_id)
+            if (
+                pending_probe is not None
+                and load_intent.block_hashes != pending_probe.pinned_hashes
+            ):
+                self._release_pending_query_probe(req_id)
+                raise RuntimeError(f"req {req_id} load hashes do not match pending query probe")
             self._pending_load_intents[req_id] = load_intent
+            self._pending_query_probes.pop(req_id, None)
             logger.debug(
                 "[PegaKVConnector] req=%s alloc: total_blocks=%d computed_blocks=%d "
                 "load_blocks=%d start_block_idx=%d load_tokens=%d pending_loads=%d",
@@ -199,6 +262,8 @@ class SchedulerConnector:
             )
 
     def build_connector_meta(self, scheduler_output: "SchedulerOutput") -> PegaConnectorMetadata:
+        self._drain_pending_query_probe_releases()
+
         # Collect potential save intents first, then apply drop decision
         potential_saves: dict[str, SaveIntent] = {}
 
@@ -390,6 +455,7 @@ class SchedulerConnector:
 
     def _cleanup_request(self, req_id: str) -> None:
         """Clean up all state for a completed request."""
+        self._release_pending_query_probe(req_id)
         self._requests.pop(req_id, None)
         self._block_hashes.pop(req_id, None)
         self._external_matched_blocks.pop(req_id, None)
@@ -492,6 +558,8 @@ class SchedulerConnector:
 
     def get_stats(self) -> PegaKVConnectorStats | None:
         """Get current connector stats for metrics exposure."""
+        self._drain_pending_query_probe_releases()
+
         # Get stats from prefetch tracker
         prefetch_stats = self._prefetch_tracker.get_stats()
 
@@ -514,6 +582,70 @@ class SchedulerConnector:
         if stats.is_empty():
             return None
         return stats
+
+    def shutdown(self) -> None:
+        for req_id in list(self._pending_query_probes):
+            self._release_pending_query_probe(req_id)
+        self._drain_pending_query_probe_releases()
+
+    def _release_pending_query_probe(self, req_id: str) -> bool:
+        probe = self._pending_query_probes.pop(req_id, None)
+        if probe is None:
+            return self._drain_pending_query_probe_releases(req_id)
+
+        remaining_probe = self._unpin_query_probe_refs(req_id, probe)
+        if remaining_probe is None:
+            return True
+
+        self._pending_query_probe_releases[req_id] = remaining_probe
+        return False
+
+    def _drain_pending_query_probe_releases(self, req_id: str | None = None) -> bool:
+        req_ids = [req_id] if req_id is not None else list(self._pending_query_probe_releases)
+        all_released = True
+        for release_req_id in req_ids:
+            probe = self._pending_query_probe_releases.pop(release_req_id, None)
+            if probe is None:
+                continue
+
+            remaining_probe = self._unpin_query_probe_refs(release_req_id, probe)
+            if remaining_probe is not None:
+                self._pending_query_probe_releases[release_req_id] = remaining_probe
+                all_released = False
+
+        return all_released
+
+    def _unpin_query_probe_refs(
+        self,
+        req_id: str,
+        probe: _PendingQueryProbe,
+    ) -> _PendingQueryProbe | None:
+        pinned_hashes = probe.pinned_hashes
+        if not pinned_hashes:
+            return None
+
+        pinned_hash_list = list(pinned_hashes)
+        try:
+            ok, message = self._ctx.engine_client.unpin(
+                self._ctx.instance_id,
+                pinned_hash_list,
+                probe.release_refs_per_hash,
+            )
+            if ok:
+                return None
+            logger.warning(
+                "[PegaKVConnector] pending query unpin failed: req=%s message=%s",
+                req_id,
+                message,
+            )
+        except Exception as e:
+            logger.warning(
+                "[PegaKVConnector] pending query unpin exception: req=%s error=%s",
+                req_id,
+                e,
+            )
+
+        return probe
 
 
 __all__ = ["SchedulerConnector"]

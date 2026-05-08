@@ -402,14 +402,37 @@ impl PegaEngine {
         instance_id: &str,
         block_hashes: &[Vec<u8>],
     ) -> Result<usize, EngineError> {
+        self.unpin_block_refs(instance_id, block_hashes, 1)
+    }
+
+    /// Unpin multiple refs for each block hash that was pinned during query.
+    ///
+    /// Used when scheduler-side query ownership is cancelled before load
+    /// consumption by any worker.
+    pub fn unpin_block_refs(
+        &self,
+        instance_id: &str,
+        block_hashes: &[Vec<u8>],
+        release_refs_per_hash: usize,
+    ) -> Result<usize, EngineError> {
+        if release_refs_per_hash == 0 {
+            return Err(EngineError::InvalidArgument(
+                "release_refs_per_hash must be greater than 0".to_string(),
+            ));
+        }
         let instance = self.get_instance(instance_id)?;
         let namespace = instance.namespace();
-        let unpinned = self
-            .storage
-            .unpin_blocks(instance_id, namespace, block_hashes);
+        let unpinned = self.storage.unpin_block_refs(
+            instance_id,
+            namespace,
+            block_hashes,
+            release_refs_per_hash,
+        );
         debug!(
-            "unpin_blocks: instance_id={instance_id} blocks={} unpinned={unpinned}",
-            block_hashes.len()
+            "unpin_block_refs: instance_id={instance_id} blocks={} release_refs_per_hash={} \
+             unpinned={unpinned}",
+            block_hashes.len(),
+            release_refs_per_hash,
         );
         Ok(unpinned)
     }

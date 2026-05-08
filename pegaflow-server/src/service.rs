@@ -596,15 +596,16 @@ impl Engine for GrpcEngineService {
         let start = Instant::now();
         let req = request.into_inner();
         let hash_count = req.block_hashes.len();
+        let release_refs_per_hash = req.release_refs_per_hash as usize;
 
         let result: Result<Response<UnpinResponse>, Status> = async {
             debug!(
-                "RPC [unpin]: instance_id={} block_hashes={}",
-                req.instance_id, hash_count
+                "RPC [unpin]: instance_id={} block_hashes={} release_refs_per_hash={}",
+                req.instance_id, hash_count, release_refs_per_hash
             );
 
             self.engine
-                .unpin_blocks(&req.instance_id, &req.block_hashes)
+                .unpin_block_refs(&req.instance_id, &req.block_hashes, release_refs_per_hash)
                 .map_err(Self::map_engine_error)?;
 
             Ok(Response::new(UnpinResponse {
@@ -616,8 +617,8 @@ impl Engine for GrpcEngineService {
         let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
         match &result {
             Ok(_) => debug!(
-                "RPC [unpin] completed: ok blocks={} elapsed_ms={:.2}",
-                hash_count, elapsed_ms
+                "RPC [unpin] completed: ok blocks={} release_refs_per_hash={} elapsed_ms={:.2}",
+                hash_count, release_refs_per_hash, elapsed_ms
             ),
             Err(status) => warn!(
                 "RPC [unpin] failed: code={} message={} elapsed_ms={:.2}",
