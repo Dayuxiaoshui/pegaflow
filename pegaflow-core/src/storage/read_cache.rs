@@ -205,11 +205,15 @@ impl ReadCache {
     /// Unpin blocks (cancellation path, before `consume_pinned_blocks`).
     ///
     /// Returns count of entries that were successfully unpinned.
-    pub(super) fn unpin_blocks(
+    /// Unpin multiple refs for each block hash in one cache operation.
+    ///
+    /// Returns count of refs that were successfully unpinned.
+    pub(super) fn unpin_block_refs(
         &self,
         instance_id: &str,
         namespace: &str,
         block_hashes: &[Vec<u8>],
+        release_refs_per_hash: usize,
     ) -> usize {
         let instance_id_owned = instance_id.to_string();
         let namespace_owned = namespace.to_string();
@@ -227,7 +231,10 @@ impl ReadCache {
         let mut unpinned = 0usize;
 
         for pin_key in &pin_keys {
-            if inner.decrement_pin(pin_key) {
+            for _ in 0..release_refs_per_hash {
+                if !inner.decrement_pin(pin_key) {
+                    break;
+                }
                 unpinned += 1;
             }
         }

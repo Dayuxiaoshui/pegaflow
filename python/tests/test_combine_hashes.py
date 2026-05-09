@@ -10,11 +10,24 @@ from __future__ import annotations
 import hashlib
 import sys
 import types
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 # ---------------------------------------------------------------------------
 # Stub the native extension *before* anything imports pegaflow.
 # ---------------------------------------------------------------------------
+
+
+class _FakeLoadState:
+    def shm_name(self) -> str:
+        return "test-shm"
+
+    def is_ready(self) -> bool:
+        return False
+
+    def get_state(self) -> int:
+        return 0
+
 
 _EXT_NAME = "pegaflow.pegaflow"
 if _EXT_NAME not in sys.modules:
@@ -23,8 +36,23 @@ if _EXT_NAME not in sys.modules:
     _ext_stub.PegaFlowBusinessError = type("PegaFlowBusinessError", (Exception,), {})  # type: ignore[attr-defined]
     _ext_stub.PegaFlowError = type("PegaFlowError", (Exception,), {})  # type: ignore[attr-defined]
     _ext_stub.PegaFlowServiceError = type("PegaFlowServiceError", (Exception,), {})  # type: ignore[attr-defined]
-    _ext_stub.PyLoadState = MagicMock  # type: ignore[attr-defined]
+    _ext_stub.PyLoadState = _FakeLoadState  # type: ignore[attr-defined]
+    _ext_stub.__version__ = "test"  # type: ignore[attr-defined]
     sys.modules[_EXT_NAME] = _ext_stub
+else:
+    _ext_stub = sys.modules[_EXT_NAME]
+    if not hasattr(_ext_stub, "EngineRpcClient"):
+        _ext_stub.EngineRpcClient = MagicMock  # type: ignore[attr-defined]
+    if not hasattr(_ext_stub, "PegaFlowBusinessError"):
+        _ext_stub.PegaFlowBusinessError = type("PegaFlowBusinessError", (Exception,), {})  # type: ignore[attr-defined]
+    if not hasattr(_ext_stub, "PegaFlowError"):
+        _ext_stub.PegaFlowError = type("PegaFlowError", (Exception,), {})  # type: ignore[attr-defined]
+    if not hasattr(_ext_stub, "PegaFlowServiceError"):
+        _ext_stub.PegaFlowServiceError = type("PegaFlowServiceError", (Exception,), {})  # type: ignore[attr-defined]
+    if not hasattr(_ext_stub, "PyLoadState"):
+        _ext_stub.PyLoadState = _FakeLoadState  # type: ignore[attr-defined]
+    if not hasattr(_ext_stub, "__version__"):
+        _ext_stub.__version__ = "test"  # type: ignore[attr-defined]
 
 from pegaflow.connector.common import ConnectorContext  # noqa: E402
 from pegaflow.connector.scheduler import SchedulerConnector  # noqa: E402
@@ -308,3 +336,147 @@ class TestDecodeHashRefresh:
         assert intent is not None
         assert intent.block_hashes == block_hashes[6:9]
         assert intent.block_ids == (200, 201, 202)
+
+
+class TestSchedulerQueryProbeReuse:
+    """Repeated scheduler probes should not repeat server-side query pins."""
+
+    def _make_connector(self, world_size: int = 1) -> tuple[SchedulerConnector, MagicMock]:
+        engine_client = MagicMock()
+        engine_client.query_prefetch.return_value = {
+            "ok": True,
+            "message": "ok",
+            "hit_blocks": 2,
+            "prefetch_state": "done",
+            "loading_blocks": 0,
+            "missing_blocks": 0,
+        }
+        engine_client.unpin.return_value = (True, "ok")
+        state_manager = MagicMock()
+        state_manager.is_available.return_value = True
+        ctx = _make_ctx(
+            engine_client=engine_client,
+            state_manager=state_manager,
+            world_size=world_size,
+        )
+        return SchedulerConnector(ctx), engine_client
+
+    def test_repeated_same_probe_reuses_query_result(self):
+        sc, engine_client = self._make_connector()
+        req = _make_fake_request("r1", [_hash(i) for i in range(4)])
+
+        first = sc.get_num_new_matched_tokens(req, num_computed_tokens=0)
+        second = sc.get_num_new_matched_tokens(req, num_computed_tokens=0)
+
+        assert first == (32, True)
+        assert second == (32, True)
+        engine_client.query_prefetch.assert_called_once()
+        engine_client.unpin.assert_not_called()
+
+    def test_committed_probe_is_not_unpinned_on_cleanup(self):
+        sc, engine_client = self._make_connector()
+        req = _make_fake_request("r1", [_hash(i) for i in range(2)])
+        blocks = _make_fake_blocks([10, 11])
+        blocks.blocks = [[SimpleNamespace(block_hash=None), SimpleNamespace(block_hash=None)]]
+
+        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
+        sc.update_state_after_alloc(req, blocks, num_external_tokens=32)
+        sc._cleanup_request("r1")
+
+        engine_client.unpin.assert_not_called()
+
+    def test_different_probe_releases_previous_uncommitted_probe(self):
+        sc, engine_client = self._make_connector()
+        req = _make_fake_request("r1", [_hash(i) for i in range(4)])
+
+        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
+        req.block_hashes = [_hash(i) for i in range(10, 14)]
+        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
+
+        assert engine_client.query_prefetch.call_count == 2
+        engine_client.unpin.assert_called_once_with("test", [_hash(0), _hash(1)], 1)
+
+    def test_uncommitted_probe_release_matches_world_size_pin_count(self):
+        sc, engine_client = self._make_connector(world_size=3)
+        req = _make_fake_request("r1", [_hash(i) for i in range(4)])
+
+        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
+        sc._cleanup_request("r1")
+
+        engine_client.unpin.assert_called_once_with("test", [_hash(0), _hash(1)], 3)
+
+    def test_failed_unpin_rpc_remains_tracked(self):
+        sc, engine_client = self._make_connector(world_size=3)
+        req = _make_fake_request("r1", [_hash(i) for i in range(4)])
+        engine_client.unpin.side_effect = RuntimeError("temporary")
+
+        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
+        sc._cleanup_request("r1")
+
+        engine_client.unpin.assert_called_once_with("test", [_hash(0), _hash(1)], 3)
+        assert "r1" not in sc._pending_query_probes
+        assert sc._pending_query_probe_releases["r1"].release_refs_per_hash == 3
+
+    def test_different_probe_does_not_overwrite_failed_release(self):
+        sc, engine_client = self._make_connector(world_size=2)
+        req = _make_fake_request("r1", [_hash(i) for i in range(4)])
+
+        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
+
+        engine_client.unpin.side_effect = RuntimeError("temporary")
+        req.block_hashes = [_hash(i) for i in range(10, 14)]
+
+        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (None, False)
+        assert engine_client.query_prefetch.call_count == 1
+        assert "r1" not in sc._pending_query_probes
+        assert sc._pending_query_probe_releases["r1"].remaining_hashes == tuple(
+            _hash(i) for i in range(4)
+        )
+        assert sc._pending_query_probe_releases["r1"].release_refs_per_hash == 2
+
+    def test_failed_release_must_clear_before_new_probe(self):
+        sc, engine_client = self._make_connector(world_size=2)
+        req = _make_fake_request("r1", [_hash(i) for i in range(4)])
+
+        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
+
+        engine_client.unpin.side_effect = RuntimeError("temporary")
+        req.block_hashes = [_hash(i) for i in range(10, 14)]
+        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (None, False)
+
+        engine_client.unpin.side_effect = None
+        engine_client.unpin.return_value = (True, "ok")
+        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
+
+        assert engine_client.query_prefetch.call_count == 2
+        assert "r1" not in sc._pending_query_probe_releases
+        assert sc._pending_query_probes["r1"].remaining_hashes == tuple(
+            _hash(i) for i in range(10, 14)
+        )
+
+    def test_cleanup_release_retry_is_drained_by_stats(self):
+        sc, engine_client = self._make_connector(world_size=1)
+        req = _make_fake_request("r1", [_hash(i) for i in range(4)])
+
+        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
+
+        engine_client.unpin.side_effect = [RuntimeError("temporary")]
+        sc._cleanup_request("r1")
+        assert sc._pending_query_probe_releases["r1"].release_refs_per_hash == 1
+
+        engine_client.unpin.side_effect = None
+        engine_client.unpin.return_value = (True, "ok")
+        sc.get_stats()
+
+        assert "r1" not in sc._pending_query_probe_releases
+
+    def test_shutdown_releases_uncommitted_probe(self):
+        sc, engine_client = self._make_connector(world_size=2)
+        req = _make_fake_request("r1", [_hash(i) for i in range(4)])
+
+        assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
+        sc.shutdown()
+
+        assert "r1" not in sc._pending_query_probes
+        assert "r1" not in sc._pending_query_probe_releases
+        engine_client.unpin.assert_called_once_with("test", [_hash(0), _hash(1)], 2)

@@ -405,6 +405,7 @@ impl EngineRpcClient {
     /// Args:
     ///     instance_id: Model instance ID
     ///     block_hashes: List of block hashes to unpin
+    ///     release_refs_per_hash: Number of pin refs to release for each hash
     ///
     /// Returns: (ok: bool, message: str)
     fn unpin(
@@ -412,12 +413,14 @@ impl EngineRpcClient {
         py: Python<'_>,
         instance_id: String,
         block_hashes: Vec<Vec<u8>>,
+        release_refs_per_hash: u32,
     ) -> PyResult<(bool, String)> {
         self.call(py, "unpin", |mut c| async move {
             let resp = c
                 .unpin(UnpinRequest {
                     instance_id,
                     block_hashes,
+                    release_refs_per_hash,
                 })
                 .await?;
             Ok(resp.into_inner())

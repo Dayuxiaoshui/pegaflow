@@ -331,7 +331,7 @@ class PeagflowRadixCache(RadixCache):
         if not block_hashes:
             return
         try:
-            ok, message = self.engine_client.unpin(self.instance_id, block_hashes)
+            ok, message = self.engine_client.unpin(self.instance_id, block_hashes, 1)
             if not ok:
                 logger.warning(f"[PeagflowRadixCache] unpin failed: {message}")
         except Exception as e:

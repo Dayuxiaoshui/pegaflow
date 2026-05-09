@@ -30,6 +30,9 @@ class VLLMServer:
         max_model_len: int | None = None,
         tensor_parallel_size: int = 1,
         pipeline_parallel_size: int = 1,
+        gpu_memory_utilization: float = 0.8,
+        extra_args: list[str] | None = None,
+        startup_timeout: int = 180,
     ):
         self.model = model
         self.port = port
@@ -39,6 +42,9 @@ class VLLMServer:
         self.max_model_len = max_model_len
         self.tensor_parallel_size = tensor_parallel_size
         self.pipeline_parallel_size = pipeline_parallel_size
+        self.gpu_memory_utilization = gpu_memory_utilization
+        self.extra_args = extra_args or []
+        self.startup_timeout = startup_timeout
         self.health_endpoints = ["/health", "/v1/models"]
         self.process: subprocess.Popen | None = None
         self.log_handle = None
@@ -54,6 +60,7 @@ class VLLMServer:
             )
 
         env = os.environ.copy()
+        env["PYTHONHASHSEED"] = "0"
         env["VLLM_BATCH_INVARIANT"] = "1"
 
         if self.use_pegaflow and self.pegaflow_port is not None:
@@ -74,7 +81,7 @@ class VLLMServer:
             "--trust-remote-code",
             "--no-enable-prefix-caching",
             "--gpu-memory-utilization",
-            "0.8",
+            str(self.gpu_memory_utilization),
             "--attention-backend",
             "FLASH_ATTN",
             "--tensor-parallel-size",
@@ -93,6 +100,8 @@ class VLLMServer:
                 "kv_connector_module_path": "pegaflow.connector",
             }
             cmd.extend(["--kv-transfer-config", json.dumps(kv_config)])
+
+        cmd.extend(self.extra_args)
 
         server_label = "PegaFlow" if self.use_pegaflow else "Baseline"
         print(f"\n[{server_label}] Starting vLLM server on port {self.port}")
@@ -116,7 +125,7 @@ class VLLMServer:
                 preexec_fn=os.setsid,
             )
 
-        self._wait_for_ready()
+        self._wait_for_ready(timeout=self.startup_timeout)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -243,6 +252,7 @@ class PegaFlowServer:
         import sysconfig
 
         env = os.environ.copy()
+        env["PYTHONHASHSEED"] = "0"
         env["PYO3_PYTHON"] = sys.executable
         env["PYTHONHOME"] = sys.base_prefix
         if libdir := sysconfig.get_config_var("LIBDIR"):
