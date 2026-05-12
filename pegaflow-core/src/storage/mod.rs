@@ -1,7 +1,11 @@
 mod prefetch;
 mod read_cache;
+mod tier_attribution;
 pub(crate) mod transfer_lock;
 mod write_path;
+
+#[cfg(any(test, feature = "test-utils"))]
+pub use tier_attribution::test_spy as tier_attribution_test_spy;
 
 use bytesize::ByteSize;
 use log::{debug, info};

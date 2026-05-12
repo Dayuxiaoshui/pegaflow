@@ -44,6 +44,15 @@ pub use storage::{MemoryCacheCleanupStats, StorageConfig};
 pub use sync_state::{LoadState, LoadStateError};
 pub use trace::{set_trace_sample_rate, should_sample};
 
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_hooks {
+    //! Internal test hooks for integration tests. Gated by `feature =
+    //! "test-utils"`, which is enabled automatically by this crate's
+    //! dev-dependencies. Not part of the stable API.
+
+    pub use crate::storage::tier_attribution_test_spy as tier_attribution;
+}
+
 use std::{
     collections::HashMap,
     fmt,

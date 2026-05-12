@@ -14,6 +14,14 @@ use crate::block::{BlockKey, PrefetchStatus};
 use crate::metrics::core_metrics;
 
 use super::read_cache::ReadCache;
+use super::tier_attribution::{
+    AttributionSource, TierAttribution, record_cache_tier_block_requests,
+};
+
+/// Upper bound on `attributed` entries to bound memory under adversarial
+/// `req_id` churn. When full, the oldest entry by `Instant` is evicted to
+/// admit the new one.
+const MAX_ATTRIBUTED_ENTRIES: usize = 4096;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum PrefetchSource {
@@ -26,6 +34,13 @@ impl PrefetchSource {
         match self {
             Self::Ssd => "ssd",
             Self::Rdma => "rdma",
+        }
+    }
+
+    const fn as_attribution(self) -> AttributionSource {
+        match self {
+            Self::Ssd => AttributionSource::Ssd,
+            Self::Rdma => AttributionSource::Rdma,
         }
     }
 }
@@ -43,6 +58,15 @@ struct LoadResult {
     source: PrefetchSource,
 }
 
+struct PrefixScan<'a> {
+    instance_id: &'a str,
+    req_id: &'a str,
+    namespace: &'a str,
+    hashes: &'a [Vec<u8>],
+    num_workers: usize,
+    emit_tier_metrics: bool,
+}
+
 struct PrefetchState {
     active: HashMap<String, PrefetchEntry>,
     /// Invariant: `inflight_count == active.values().map(|e| e.loading_count).sum()`
@@ -50,6 +74,12 @@ struct PrefetchState {
     /// req_ids where RDMA remote fetch returned zero blocks (remote evicted).
     /// Prevents re-triggering RDMA on every subsequent poll for the same request.
     failed_remote: HashMap<String, Instant>,
+    /// req_ids whose tier attribution has already been recorded. Subsequent
+    /// loading polls, the post-completion fall-through scan, and late
+    /// duplicate retries for the same `req_id` must not re-attribute.
+    /// Bounded by `MAX_ATTRIBUTED_ENTRIES` and GC'd by TTL alongside
+    /// `failed_remote`.
+    attributed: HashMap<String, Instant>,
 }
 
 impl PrefetchState {
@@ -60,6 +90,33 @@ impl PrefetchState {
         } else {
             None
         }
+    }
+
+    /// Mark `req_id` as attributed. Returns `true` if this is the first
+    /// attribution (caller should emit metrics), `false` if a previous
+    /// attribution still lives in the table.
+    ///
+    /// Enforces `MAX_ATTRIBUTED_ENTRIES` by evicting the oldest entry on
+    /// overflow. Runs under the `PrefetchState` mutex and never crosses an
+    /// `.await`.
+    fn try_mark_attributed(&mut self, req_id: &str, now: Instant) -> bool {
+        if self.attributed.contains_key(req_id) {
+            return false;
+        }
+        if self.attributed.len() >= MAX_ATTRIBUTED_ENTRIES {
+            // O(N) scan over a bounded table; N <= 4096, runs only on
+            // overflow.
+            if let Some(oldest) = self
+                .attributed
+                .iter()
+                .min_by_key(|(_, ts)| **ts)
+                .map(|(k, _)| k.clone())
+            {
+                self.attributed.remove(&oldest);
+            }
+        }
+        self.attributed.insert(req_id.to_string(), now);
+        true
     }
 }
 
@@ -81,6 +138,7 @@ impl PrefetchScheduler {
                 active: HashMap::new(),
                 inflight_count: 0,
                 failed_remote: HashMap::new(),
+                attributed: HashMap::new(),
             }),
             ssd_store,
             rdma_fetch,
@@ -97,24 +155,36 @@ impl PrefetchScheduler {
         hashes: &[Vec<u8>],
         num_workers: usize,
     ) -> PrefetchStatus {
+        // Default: this call may be the first decision and should attribute.
+        let mut emit_tier_metrics = true;
         if let Some(status) = self.poll_existing(read_cache, req_id) {
             match status {
                 PollResult::StillLoading => {
                     return PrefetchStatus::Loading { hit: 0, loading: 1 };
                 }
                 PollResult::Completed => {
-                    // Fall through to full scan
+                    // Backing has just written blocks into read_cache. The
+                    // fall-through scan will re-see them as RAM hits; we MUST
+                    // NOT attribute again, because we already attributed
+                    // them as `rdma`/`ssd` on the first decision.
+                    //
+                    // Belt-and-suspenders: `attributed` also guards this, but
+                    // the explicit flag is the easiest review surface.
+                    emit_tier_metrics = false;
                 }
             }
         }
 
         self.full_prefix_scan(
             read_cache,
-            instance_id,
-            req_id,
-            namespace,
-            hashes,
-            num_workers,
+            PrefixScan {
+                instance_id,
+                req_id,
+                namespace,
+                hashes,
+                num_workers,
+                emit_tier_metrics,
+            },
         )
         .await
     }
@@ -163,18 +233,15 @@ impl PrefetchScheduler {
     async fn full_prefix_scan(
         &self,
         read_cache: &ReadCache,
-        instance_id: &str,
-        req_id: &str,
-        namespace: &str,
-        hashes: &[Vec<u8>],
-        num_workers: usize,
+        scan: PrefixScan<'_>,
     ) -> PrefetchStatus {
         let total_start = Instant::now();
 
         let key_build_start = Instant::now();
-        let keys: Vec<BlockKey> = hashes
+        let keys: Vec<BlockKey> = scan
+            .hashes
             .iter()
-            .map(|hash| BlockKey::new(namespace.to_string(), hash.clone()))
+            .map(|hash| BlockKey::new(scan.namespace.to_string(), hash.clone()))
             .collect();
         let key_build = key_build_start.elapsed();
 
@@ -184,7 +251,7 @@ impl PrefetchScheduler {
         let remaining = &keys[hit..];
 
         let load_select_start = Instant::now();
-        let load = self.try_load(req_id, namespace, remaining).await;
+        let load = self.try_load(scan.req_id, scan.namespace, remaining).await;
         let load_select = load_select_start.elapsed();
         let loading = load.as_ref().map_or(0, |l| l.found);
         let missing = keys.len() - hit - loading;
@@ -192,12 +259,21 @@ impl PrefetchScheduler {
         if let Some(load) = load {
             let source = load.source;
             let register_start = Instant::now();
-            self.register_inflight(req_id, load);
+            self.register_inflight(scan.req_id, load);
             let register = register_start.elapsed();
+
+            self.maybe_record_tier_attribution(
+                scan.req_id,
+                keys.len(),
+                hit,
+                loading,
+                Some(source.as_attribution()),
+                scan.emit_tier_metrics,
+            );
 
             info!(
                 "Prefetch scheduling timing: req_id={} source={} total_keys={} hit={} loading={} missing={} key_build={:?} cache_scan={:?} load_select={:?} register_inflight={:?} total={:?}",
-                req_id,
+                scan.req_id,
                 source.as_str(),
                 keys.len(),
                 hit,
@@ -212,11 +288,21 @@ impl PrefetchScheduler {
             PrefetchStatus::Loading { hit, loading }
         } else {
             let pin_start = Instant::now();
-            read_cache.pin_blocks(instance_id, num_workers, &blocks_to_pin);
+            read_cache.pin_blocks(scan.instance_id, scan.num_workers, &blocks_to_pin);
             let pin = pin_start.elapsed();
+
+            self.maybe_record_tier_attribution(
+                scan.req_id,
+                keys.len(),
+                hit,
+                /* loading = */ 0,
+                /* loading_source = */ None,
+                scan.emit_tier_metrics,
+            );
+
             info!(
                 "Prefetch local-hit timing: req_id={} total_keys={} hit={} missing={} key_build={:?} cache_scan={:?} load_select={:?} pin={:?} total={:?}",
-                req_id,
+                scan.req_id,
                 keys.len(),
                 hit,
                 missing,
@@ -230,7 +316,37 @@ impl PrefetchScheduler {
         }
     }
 
-    /// Priority fallback: RDMA → SSD. Returns `None` when neither source has blocks.
+    /// Attribute this `query_prefetch` decision once per `req_id`. Skips
+    /// attribution when:
+    /// * `emit_tier_metrics == false` (e.g. post-completion fall-through);
+    /// * `keys` was empty (no decision to attribute);
+    /// * `try_mark_attributed` reports the req_id was already attributed.
+    fn maybe_record_tier_attribution(
+        &self,
+        req_id: &str,
+        total: usize,
+        hit: usize,
+        loading: usize,
+        loading_source: Option<AttributionSource>,
+        emit_tier_metrics: bool,
+    ) {
+        if !emit_tier_metrics || total == 0 {
+            return;
+        }
+        let marked = self
+            .state
+            .lock()
+            .try_mark_attributed(req_id, Instant::now());
+        if !marked {
+            return;
+        }
+        let attribution = TierAttribution::classify(total, hit, loading, loading_source);
+        #[cfg(any(test, feature = "test-utils"))]
+        super::tier_attribution::test_spy::record(req_id, attribution);
+        record_cache_tier_block_requests(total, attribution);
+    }
+
+    /// Priority fallback: RDMA -> SSD. Returns `None` when neither source has blocks.
     async fn try_load(
         &self,
         req_id: &str,
@@ -327,15 +443,81 @@ impl PrefetchScheduler {
         );
     }
 
+    /// Sweep both `failed_remote` and `attributed` entries older than `max_age`.
+    /// Runs under the single `PrefetchState` mutex. Returns
+    /// `(failed_remote_cleaned, attributed_cleaned)`.
     pub(super) fn gc_failed_remote(&self, max_age: std::time::Duration) -> usize {
+        let (failed_cleaned, _) = self.gc_state(max_age);
+        failed_cleaned
+    }
+
+    /// Like `gc_failed_remote` but exposes attributed GC counts for tests.
+    pub(super) fn gc_state(&self, max_age: std::time::Duration) -> (usize, usize) {
         let mut state = self.state.lock();
-        let before = state.failed_remote.len();
+        let failed_before = state.failed_remote.len();
         state.failed_remote.retain(|_, ts| ts.elapsed() < max_age);
-        before - state.failed_remote.len()
+        let attributed_before = state.attributed.len();
+        state.attributed.retain(|_, ts| ts.elapsed() < max_age);
+        (
+            failed_before - state.failed_remote.len(),
+            attributed_before - state.attributed.len(),
+        )
     }
 }
 
 enum PollResult {
     StillLoading,
     Completed,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_state() -> PrefetchState {
+        PrefetchState {
+            active: HashMap::new(),
+            inflight_count: 0,
+            failed_remote: HashMap::new(),
+            attributed: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn try_mark_attributed_first_call_is_true_repeat_is_false() {
+        let mut state = make_state();
+        let now = Instant::now();
+        assert!(state.try_mark_attributed("req-1", now));
+        assert!(!state.try_mark_attributed("req-1", now));
+        assert_eq!(state.attributed.len(), 1);
+    }
+
+    #[test]
+    fn try_mark_attributed_distinct_req_ids_each_attribute_once() {
+        let mut state = make_state();
+        let now = Instant::now();
+        assert!(state.try_mark_attributed("req-a", now));
+        assert!(state.try_mark_attributed("req-b", now));
+        assert_eq!(state.attributed.len(), 2);
+    }
+
+    #[test]
+    fn try_mark_attributed_evicts_oldest_at_capacity() {
+        let mut state = make_state();
+        // Fill to capacity with monotonically increasing timestamps so the
+        // first entry is unambiguously the oldest.
+        let base = Instant::now();
+        for i in 0..MAX_ATTRIBUTED_ENTRIES {
+            // Spread timestamps by 1ns each; `Instant` ordering is well-defined.
+            let ts = base + std::time::Duration::from_nanos(i as u64);
+            state.try_mark_attributed(&format!("req-{i}"), ts);
+        }
+        assert_eq!(state.attributed.len(), MAX_ATTRIBUTED_ENTRIES);
+        // The next insertion should evict "req-0" (oldest).
+        let ts = base + std::time::Duration::from_nanos(MAX_ATTRIBUTED_ENTRIES as u64);
+        assert!(state.try_mark_attributed("req-new", ts));
+        assert_eq!(state.attributed.len(), MAX_ATTRIBUTED_ENTRIES);
+        assert!(!state.attributed.contains_key("req-0"));
+        assert!(state.attributed.contains_key("req-new"));
+    }
 }
