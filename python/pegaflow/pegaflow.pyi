@@ -145,8 +145,7 @@ class EngineRpcClient:
         device_id: int,
         load_state_shm: str,
         layer_names: list[str],
-        block_ids: list[int],
-        block_hashes: list[bytes],
+        leases: list[tuple[str, list[int]]],
     ) -> tuple[bool, str]:
         """Load KV blocks from the engine.
 
@@ -156,8 +155,7 @@ class EngineRpcClient:
             device_id: CUDA device ID.
             load_state_shm: Shared memory name from PyLoadState.shm_name().
             layer_names: List of layer names to load.
-            block_ids: GPU block IDs to load into.
-            block_hashes: Content hashes for blocks.
+            leases: List of (load_lease_id, block_ids) tuples.
 
         Returns:
             Tuple of (ok, message) indicating success/failure.
@@ -168,30 +166,28 @@ class EngineRpcClient:
         """
         ...
 
-    def query_prefetch(
+    def reserve_load(
         self,
         instance_id: str,
         block_hashes: list[bytes],
-        req_id: str,
+        request_id: str,
     ) -> dict[str, Any]:
-        """Query prefix cache hits with SSD prefetch support.
+        """Reserve prefix cache hits for a later load.
 
-        Checks memory cache and triggers SSD prefetch for missing blocks.
-        Pins hit blocks for subsequent load operations.
+        Checks memory cache and triggers backing prefetch for missing blocks.
 
         Args:
             instance_id: Model instance ID.
             block_hashes: List of block hashes to check.
-            req_id: Request ID for tracking and prefetch correlation.
+            request_id: Request ID for tracking and prefetch correlation.
 
         Returns:
             Dict with keys:
                 - ok (bool): Whether the request succeeded.
                 - message (str): Error message if failed.
                 - hit_blocks (int): Number of blocks ready in cache.
-                - prefetch_state (str): One of "done", "loading".
-                - loading_blocks (int): Number of blocks being prefetched from SSD.
-                - missing_blocks (int): Number of blocks not found anywhere.
+                - state (str): One of "ready", "loading".
+                - load_lease_id (str): UUID set when state is "ready" and hit_blocks > 0.
 
         Raises:
             PegaFlowServiceError: If server is unavailable.
@@ -199,21 +195,16 @@ class EngineRpcClient:
         """
         ...
 
-    def unpin(
+    def release_load_lease(
         self,
-        instance_id: str,
-        block_hashes: list[bytes],
-        release_refs_per_hash: int,
+        load_lease_id: str,
     ) -> tuple[bool, str]:
-        """Unpin blocks that were pinned during query.
+        """Release a load lease that was reserved but will not be consumed.
 
-        Call this when load is cancelled or preempted before consumption
-        to release pinned blocks and prevent memory leaks.
+        Call this when load is cancelled or preempted before consumption.
 
         Args:
-            instance_id: Model instance ID.
-            block_hashes: List of block hashes to unpin.
-            release_refs_per_hash: Number of pin refs to release for each hash.
+            load_lease_id: UUID returned by reserve_load.
 
         Returns:
             Tuple of (ok, message) indicating success/failure.

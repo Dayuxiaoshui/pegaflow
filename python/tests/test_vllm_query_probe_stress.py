@@ -138,7 +138,7 @@ def test_query_probe_reuse_under_pressure(
             pega_text,
             (
                 "cache_lookup",
-                "pending query unpin",
+                "pending load lease release",
                 "Preempt",
                 "preempt",
                 "abort",
@@ -153,12 +153,12 @@ def test_query_probe_reuse_under_pressure(
             f"Interesting lines:\n{interesting}"
         )
         assert "cache_lookup: hit_blocks=0" in pega_text
-        assert "pending query unpin failed" not in pega_text
-        assert "pending query unpin exception" not in pega_text
+        assert "pending load lease release failed" not in pega_text
+        assert "pending load lease release exception" not in pega_text
 
         hits = _metric_delta(metrics_start, metrics_end, "pegaflow_cache_block_hits_total")
         loads = _metric_delta(metrics_start, metrics_end, "pegaflow_load_bytes_total")
         assert hits > 0 or loads > 0, (
             f"Expected warm-hit/load activity, got hits={hits}, loads={loads}.\n"
-            f"Server log tail:\n{_grep_log(server_text, ('hit=', 'load', 'unpin'))}"
+            f"Server log tail:\n{_grep_log(server_text, ('hit=', 'load', 'release_load_lease'))}"
         )

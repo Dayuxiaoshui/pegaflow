@@ -1,13 +1,13 @@
 //! Prefix-hit semantics tests.
 //!
-//! Verifies that `count_prefix_hit_blocks_with_prefetch` returns the longest
+//! Verifies that `reserve_load` returns the longest
 //! contiguous prefix of cached blocks — gaps and missing leading blocks
 //! correctly terminate the prefix.
 
 mod common;
 
 use common::*;
-use pegaflow_core::PrefetchStatus;
+use pegaflow_core::ReserveLoadStatus;
 
 /// Save first 3 of 5 blocks; prefix scan should stop at block 3.
 #[tokio::test]
@@ -22,13 +22,17 @@ async fn partial_prefix_reports_contiguous_hit_count() {
     env.save_layer_and_flush(0, &save_hashes).await;
 
     match env.query(&query_hashes).await {
-        PrefetchStatus::Done { hit, missing } => {
+        ReserveLoadStatus::Ready {
+            hit,
+            missing,
+            lease_id,
+        } => {
             assert_eq!(hit, 3);
             assert_eq!(missing, 2);
+            env.release_lease(&lease_id);
         }
-        other => panic!("expected Done, got {other:?}"),
+        other => panic!("expected Ready, got {other:?}"),
     }
-    env.unpin(&query_hashes[..3]);
 }
 
 /// Cache holds h0, h2, h3 but not h1. Prefix scan should stop at h1.
@@ -50,13 +54,17 @@ async fn gap_in_cached_blocks_breaks_prefix() {
     env.save_layer_and_flush(0, &save_hashes).await;
 
     match env.query(&all_hashes).await {
-        PrefetchStatus::Done { hit, missing } => {
+        ReserveLoadStatus::Ready {
+            hit,
+            missing,
+            lease_id,
+        } => {
             assert_eq!(hit, 1, "prefix should stop at first gap");
             assert_eq!(missing, 3);
+            env.release_lease(&lease_id);
         }
-        other => panic!("expected Done, got {other:?}"),
+        other => panic!("expected Ready, got {other:?}"),
     }
-    env.unpin(&all_hashes[..1]);
 }
 
 /// Cache holds h1, h2, h3 but not h0. Hit count should be 0.
@@ -76,11 +84,11 @@ async fn first_block_missing_yields_zero_prefix_hit() {
     env.save_layer_and_flush(0, &save_hashes).await;
 
     match env.query(&all_hashes).await {
-        PrefetchStatus::Done { hit, missing } => {
+        ReserveLoadStatus::Ready { hit, missing, .. } => {
             assert_eq!(hit, 0);
             assert_eq!(missing, 4);
         }
-        other => panic!("expected Done, got {other:?}"),
+        other => panic!("expected Ready, got {other:?}"),
     }
     // hit=0, nothing pinned
 }
@@ -93,10 +101,10 @@ async fn empty_query_returns_zero() {
         .build();
 
     match env.query(&[]).await {
-        PrefetchStatus::Done { hit, missing } => {
+        ReserveLoadStatus::Ready { hit, missing, .. } => {
             assert_eq!(hit, 0);
             assert_eq!(missing, 0);
         }
-        other => panic!("expected Done, got {other:?}"),
+        other => panic!("expected Ready, got {other:?}"),
     }
 }

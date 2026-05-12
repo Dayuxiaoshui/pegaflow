@@ -160,8 +160,8 @@ pub struct Cli {
     /// HLL sliding-window list for hit-rate estimation. Comma-separated humantime
     /// durations; each becomes a canonical `window` label in metrics (e.g. `15m,1h,1d`).
     /// Slot duration is derived as `clamp(window/24, 1min, 1h)`.
-    #[arg(long, default_value = "15m,1h,24h", value_parser = parse_hll_windows)]
-    pub metric_hll_windows: Vec<(String, Duration)>,
+    #[arg(long, default_value = "15m,1h,24h")]
+    pub metric_hll_windows: String,
 
     /// HLL bucket index bits 4–18 (default: 14 → 16384 buckets, ~0.8% error)
     #[arg(long, default_value_t = 14, value_parser = parse_hll_bucket_bits)]
@@ -550,7 +550,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
     let hll_tracker = Arc::new(std::sync::Mutex::new(
         pegaflow_common::hll::MultiWindowHllTracker::new(
-            cli.metric_hll_windows.clone(),
+            parse_hll_windows(&cli.metric_hll_windows)
+                .map_err(|err| format!("invalid --metric-hll-windows: {err}"))?,
             cli.metric_hll_bucket_bits,
         ),
     ));

@@ -43,13 +43,17 @@ pub enum BlockStatus {
     Miss,
 }
 
-/// Result of checking prefix hits with SSD prefetch support
+/// Result of reserving prefix blocks for a later load.
 #[derive(Debug, Clone)]
-pub enum PrefetchStatus {
+pub enum ReserveLoadStatus {
     /// Blocks are being prefetched - caller should retry
-    Loading { hit: usize, loading: usize },
-    /// Terminal state: hit/missing counts final (missing=0 means full hit)
-    Done { hit: usize, missing: usize },
+    Loading { hit: usize },
+    /// Terminal state: available prefix blocks are covered by `lease_id`.
+    Ready {
+        hit: usize,
+        missing: usize,
+        lease_id: String,
+    },
 }
 
 // ============================================================================

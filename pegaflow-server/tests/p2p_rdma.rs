@@ -184,12 +184,17 @@ async fn wait_for_cache(
     let deadline = Instant::now() + timeout;
     loop {
         let status = engine
-            .count_prefix_hit_blocks_with_prefetch(instance_id, "wait-for-cache", block_hashes)
+            .reserve_load(instance_id, "wait-for-cache", block_hashes)
             .await
-            .expect("count_prefix_hit_blocks_with_prefetch");
+            .expect("reserve_load");
         let hit = match status {
-            PrefetchStatus::Done { hit, .. } => hit,
-            PrefetchStatus::Loading { hit, .. } => hit,
+            ReserveLoadStatus::Ready { hit, lease_id, .. } => {
+                if !lease_id.is_empty() {
+                    engine.release_load_lease(&lease_id);
+                }
+                hit
+            }
+            ReserveLoadStatus::Loading { hit } => hit,
         };
         if hit >= expected_hit {
             return;
@@ -232,23 +237,32 @@ async fn wait_for_prefetch_done(
     block_hashes: &[Vec<u8>],
     expected_hit: usize,
     timeout: Duration,
-) {
+) -> String {
     let deadline = Instant::now() + timeout;
     loop {
         let status = engine
-            .count_prefix_hit_blocks_with_prefetch(instance_id, req_id, block_hashes)
+            .reserve_load(instance_id, req_id, block_hashes)
             .await
-            .expect("count_prefix_hit_blocks_with_prefetch");
+            .expect("reserve_load");
         match status {
-            PrefetchStatus::Done { hit, .. } if hit >= expected_hit => return,
-            PrefetchStatus::Done { hit, missing } => {
+            ReserveLoadStatus::Ready { hit, lease_id, .. } if hit >= expected_hit => {
+                return lease_id;
+            }
+            ReserveLoadStatus::Ready {
+                hit,
+                missing,
+                lease_id,
+            } => {
+                if !lease_id.is_empty() {
+                    engine.release_load_lease(&lease_id);
+                }
                 assert!(
                     Instant::now() < deadline,
                     "prefetch done but hit={hit} missing={missing}, \
                      expected hit>={expected_hit}"
                 );
             }
-            PrefetchStatus::Loading { .. } => {}
+            ReserveLoadStatus::Loading { .. } => {}
         }
         assert!(
             Instant::now() < deadline,
@@ -390,7 +404,7 @@ async fn p2p_rdma_remote_fetch_roundtrip() {
         .expect("register layer on engine B");
 
     // ── 8. Remote fetch: Engine B discovers blocks via MetaServer → RDMA READ ──
-    wait_for_prefetch_done(
+    let load_lease_id = wait_for_prefetch_done(
         &engine_b,
         "inst-b",
         "req-1",
@@ -404,16 +418,9 @@ async fn p2p_rdma_remote_fetch_roundtrip() {
     let load_state = LoadState::new().expect("create LoadState");
     let shm_name = load_state.shm_name().to_string();
 
+    let leases = vec![(load_lease_id.as_str(), block_ids.clone())];
     engine_b
-        .batch_load_kv_blocks_multi_layer(
-            "inst-b",
-            0,
-            DEVICE_ID,
-            &shm_name,
-            &[LAYER],
-            &block_ids,
-            &block_hashes,
-        )
+        .batch_load_kv_blocks_multi_layer("inst-b", 0, DEVICE_ID, &shm_name, &[LAYER], &leases)
         .expect("batch_load on engine B");
 
     let deadline = Instant::now() + Duration::from_secs(5);

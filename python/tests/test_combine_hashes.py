@@ -343,15 +343,14 @@ class TestSchedulerQueryProbeReuse:
 
     def _make_connector(self, world_size: int = 1) -> tuple[SchedulerConnector, MagicMock]:
         engine_client = MagicMock()
-        engine_client.query_prefetch.return_value = {
+        engine_client.reserve_load.return_value = {
             "ok": True,
             "message": "ok",
             "hit_blocks": 2,
-            "prefetch_state": "done",
-            "loading_blocks": 0,
-            "missing_blocks": 0,
+            "state": "ready",
+            "load_lease_id": "lease-r1",
         }
-        engine_client.unpin.return_value = (True, "ok")
+        engine_client.release_load_lease.return_value = (True, "ok")
         state_manager = MagicMock()
         state_manager.is_available.return_value = True
         ctx = _make_ctx(
@@ -370,10 +369,10 @@ class TestSchedulerQueryProbeReuse:
 
         assert first == (32, True)
         assert second == (32, True)
-        engine_client.query_prefetch.assert_called_once()
-        engine_client.unpin.assert_not_called()
+        engine_client.reserve_load.assert_called_once()
+        engine_client.release_load_lease.assert_not_called()
 
-    def test_committed_probe_is_not_unpinned_on_cleanup(self):
+    def test_committed_probe_is_not_released_on_cleanup(self):
         sc, engine_client = self._make_connector()
         req = _make_fake_request("r1", [_hash(i) for i in range(2)])
         blocks = _make_fake_blocks([10, 11])
@@ -383,7 +382,7 @@ class TestSchedulerQueryProbeReuse:
         sc.update_state_after_alloc(req, blocks, num_external_tokens=32)
         sc._cleanup_request("r1")
 
-        engine_client.unpin.assert_not_called()
+        engine_client.release_load_lease.assert_not_called()
 
     def test_different_probe_releases_previous_uncommitted_probe(self):
         sc, engine_client = self._make_connector()
@@ -393,8 +392,8 @@ class TestSchedulerQueryProbeReuse:
         req.block_hashes = [_hash(i) for i in range(10, 14)]
         assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
 
-        assert engine_client.query_prefetch.call_count == 2
-        engine_client.unpin.assert_called_once_with("test", [_hash(0), _hash(1)], 1)
+        assert engine_client.reserve_load.call_count == 2
+        engine_client.release_load_lease.assert_called_once_with("lease-r1")
 
     def test_uncommitted_probe_release_matches_world_size_pin_count(self):
         sc, engine_client = self._make_connector(world_size=3)
@@ -403,19 +402,19 @@ class TestSchedulerQueryProbeReuse:
         assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
         sc._cleanup_request("r1")
 
-        engine_client.unpin.assert_called_once_with("test", [_hash(0), _hash(1)], 3)
+        engine_client.release_load_lease.assert_called_once_with("lease-r1")
 
-    def test_failed_unpin_rpc_remains_tracked(self):
+    def test_failed_release_rpc_remains_tracked(self):
         sc, engine_client = self._make_connector(world_size=3)
         req = _make_fake_request("r1", [_hash(i) for i in range(4)])
-        engine_client.unpin.side_effect = RuntimeError("temporary")
+        engine_client.release_load_lease.side_effect = RuntimeError("temporary")
 
         assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
         sc._cleanup_request("r1")
 
-        engine_client.unpin.assert_called_once_with("test", [_hash(0), _hash(1)], 3)
+        engine_client.release_load_lease.assert_called_once_with("lease-r1")
         assert "r1" not in sc._pending_query_probes
-        assert sc._pending_query_probe_releases["r1"].release_refs_per_hash == 3
+        assert sc._pending_query_probe_releases["r1"].load_lease_id == "lease-r1"
 
     def test_different_probe_does_not_overwrite_failed_release(self):
         sc, engine_client = self._make_connector(world_size=2)
@@ -423,16 +422,16 @@ class TestSchedulerQueryProbeReuse:
 
         assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
 
-        engine_client.unpin.side_effect = RuntimeError("temporary")
+        engine_client.release_load_lease.side_effect = RuntimeError("temporary")
         req.block_hashes = [_hash(i) for i in range(10, 14)]
 
         assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (None, False)
-        assert engine_client.query_prefetch.call_count == 1
+        assert engine_client.reserve_load.call_count == 1
         assert "r1" not in sc._pending_query_probes
         assert sc._pending_query_probe_releases["r1"].remaining_hashes == tuple(
             _hash(i) for i in range(4)
         )
-        assert sc._pending_query_probe_releases["r1"].release_refs_per_hash == 2
+        assert sc._pending_query_probe_releases["r1"].load_lease_id == "lease-r1"
 
     def test_failed_release_must_clear_before_new_probe(self):
         sc, engine_client = self._make_connector(world_size=2)
@@ -440,15 +439,15 @@ class TestSchedulerQueryProbeReuse:
 
         assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
 
-        engine_client.unpin.side_effect = RuntimeError("temporary")
+        engine_client.release_load_lease.side_effect = RuntimeError("temporary")
         req.block_hashes = [_hash(i) for i in range(10, 14)]
         assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (None, False)
 
-        engine_client.unpin.side_effect = None
-        engine_client.unpin.return_value = (True, "ok")
+        engine_client.release_load_lease.side_effect = None
+        engine_client.release_load_lease.return_value = (True, "ok")
         assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
 
-        assert engine_client.query_prefetch.call_count == 2
+        assert engine_client.reserve_load.call_count == 2
         assert "r1" not in sc._pending_query_probe_releases
         assert sc._pending_query_probes["r1"].remaining_hashes == tuple(
             _hash(i) for i in range(10, 14)
@@ -460,12 +459,12 @@ class TestSchedulerQueryProbeReuse:
 
         assert sc.get_num_new_matched_tokens(req, num_computed_tokens=0) == (32, True)
 
-        engine_client.unpin.side_effect = [RuntimeError("temporary")]
+        engine_client.release_load_lease.side_effect = [RuntimeError("temporary")]
         sc._cleanup_request("r1")
-        assert sc._pending_query_probe_releases["r1"].release_refs_per_hash == 1
+        assert sc._pending_query_probe_releases["r1"].load_lease_id == "lease-r1"
 
-        engine_client.unpin.side_effect = None
-        engine_client.unpin.return_value = (True, "ok")
+        engine_client.release_load_lease.side_effect = None
+        engine_client.release_load_lease.return_value = (True, "ok")
         sc.get_stats()
 
         assert "r1" not in sc._pending_query_probe_releases
@@ -479,4 +478,4 @@ class TestSchedulerQueryProbeReuse:
 
         assert "r1" not in sc._pending_query_probes
         assert "r1" not in sc._pending_query_probe_releases
-        engine_client.unpin.assert_called_once_with("test", [_hash(0), _hash(1)], 2)
+        engine_client.release_load_lease.assert_called_once_with("lease-r1")

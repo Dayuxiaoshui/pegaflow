@@ -1,6 +1,6 @@
-// Decision-level tier attribution for `query_prefetch`.
+// Decision-level tier attribution for `reserve_load`.
 //
-// Splits a single `query_prefetch` decision's block budget into four mutually
+// Splits a single `reserve_load` decision's block budget into four mutually
 // exclusive tiers: RAM (resident-cache prefix hit), RDMA / SSD (backing tier
 // selected to satisfy the remaining prefix), and MISS (everything no tier
 // could satisfy this decision, including SSD backpressure and RDMA partial
@@ -13,7 +13,7 @@
 // completion / failure must be observed via the existing `rdma_fetch_total`
 // and `ssd_prefetch_failures` counters.
 
-/// The tier a block was attributed to for a single `query_prefetch` decision.
+/// The tier a block was attributed to for a single `reserve_load` decision.
 ///
 /// Only backing tiers (`Rdma`, `Ssd`) are represented here; the local RAM
 /// prefix hit is conveyed through the `hit` argument to `classify` rather

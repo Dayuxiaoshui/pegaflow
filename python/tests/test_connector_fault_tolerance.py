@@ -44,9 +44,9 @@ class FakeEngineClient:
         device_id: int,
         load_state_shm: str,
         layer_names,
-        block_ids,
-        block_hashes,
+        leases,
     ) -> tuple[bool, str]:
+        block_ids = [block_id for _, ids in leases for block_id in ids]
         self.load_calls.append(
             (
                 instance_id,
@@ -105,7 +105,7 @@ def _load_metadata(req_id: str, block_ids: tuple[int, ...]) -> PegaConnectorMeta
         load_intents={
             req_id: LoadIntent(
                 block_ids=block_ids,
-                block_hashes=tuple(f"h{b}".encode() for b in block_ids),
+                load_lease_id=f"lease-{req_id}",
                 num_tokens=len(block_ids) * 16,
             )
         }

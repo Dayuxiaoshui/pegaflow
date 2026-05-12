@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use cudarc::driver::CudaContext;
 use pegaflow_core::*;
@@ -99,6 +99,7 @@ pub struct TestEnv {
     pub instance_id: String,
     pub layers: Vec<RegisteredLayer>,
     pub world_size: usize,
+    pending_load_lease: Mutex<Option<String>>,
 }
 
 struct LayerSpec {
@@ -241,6 +242,7 @@ impl TestEnvBuilder {
             instance_id: self.instance_id.to_string(),
             layers,
             world_size: self.world_size,
+            pending_load_lease: Mutex::new(None),
         }
     }
 }
@@ -315,51 +317,61 @@ impl TestEnv {
         self.engine.flush_saves().await;
     }
 
-    /// Query prefix hits. Returns raw PrefetchStatus. Leaves blocks pinned on hit.
-    pub async fn query(&self, hashes: &[Vec<u8>]) -> PrefetchStatus {
+    /// Reserve prefix hits. Returns raw ReserveLoadStatus. Leaves a lease on hit.
+    pub async fn query(&self, hashes: &[Vec<u8>]) -> ReserveLoadStatus {
         self.engine
-            .count_prefix_hit_blocks_with_prefetch(&self.instance_id, "test", hashes)
+            .reserve_load(&self.instance_id, "test", hashes)
             .await
             .expect("query")
     }
 
-    /// Query, assert all hit, leave pinned (scheduler step before load).
-    pub async fn assert_all_hit_and_pin(&self, hashes: &[Vec<u8>]) {
+    /// Reserve, assert all hit, keep the lease for load_to_gpu.
+    pub async fn assert_all_hit_and_reserve(&self, hashes: &[Vec<u8>]) {
         match self.query(hashes).await {
-            PrefetchStatus::Done { hit, missing } => {
+            ReserveLoadStatus::Ready {
+                hit,
+                missing,
+                lease_id,
+            } => {
                 assert_eq!(hit, hashes.len(), "expected all blocks hit");
                 assert_eq!(missing, 0);
+                assert!(!lease_id.is_empty(), "expected non-empty load lease");
+                *self.pending_load_lease.lock().expect("lease lock") = Some(lease_id);
             }
-            other => panic!("expected Done, got {:?}", other),
+            other => panic!("expected Ready, got {:?}", other),
         }
     }
 
-    pub fn unpin(&self, hashes: &[Vec<u8>]) {
-        for _ in 0..self.world_size.max(1) {
-            self.engine
-                .unpin_blocks(&self.instance_id, hashes)
-                .expect("unpin");
+    pub fn release_lease(&self, lease_id: &str) {
+        self.engine.release_load_lease(lease_id);
+    }
+
+    /// Count cache hits, then release the lease (for probing without consuming).
+    pub async fn count_hits_then_release(&self, hashes: &[Vec<u8>]) -> usize {
+        match self.query(hashes).await {
+            ReserveLoadStatus::Ready { hit, lease_id, .. } => {
+                if !lease_id.is_empty() {
+                    self.release_lease(&lease_id);
+                }
+                hit
+            }
+            ReserveLoadStatus::Loading { hit } => hit,
         }
     }
 
-    /// Count cache hits, then unpin (for probing without consuming).
-    pub async fn count_hits_then_unpin(&self, hashes: &[Vec<u8>]) -> usize {
-        let hit = match self.query(hashes).await {
-            PrefetchStatus::Done { hit, .. } => hit,
-            PrefetchStatus::Loading { hit, .. } => hit,
-        };
-        if hit > 0 {
-            self.unpin(&hashes[..hit]);
-        }
-        hit
-    }
-
-    /// Load blocks from cache to GPU (pin must already be held).
+    /// Load blocks from cache to GPU (lease must already be held).
     pub async fn load_to_gpu(&self, hashes: &[Vec<u8>]) {
         let block_ids: Vec<i32> = (0..hashes.len() as i32).collect();
         let layer_names: Vec<&str> = self.layers.iter().map(|l| l.name.as_str()).collect();
         let load_state = LoadState::new().expect("create LoadState");
         let shm_name = load_state.shm_name().to_string();
+        let lease_id = self
+            .pending_load_lease
+            .lock()
+            .expect("lease lock")
+            .clone()
+            .expect("load lease must be reserved before load");
+        let leases = vec![(lease_id.as_str(), block_ids)];
         self.engine
             .batch_load_kv_blocks_multi_layer(
                 &self.instance_id,
@@ -367,8 +379,7 @@ impl TestEnv {
                 0,
                 &shm_name,
                 &layer_names,
-                &block_ids,
-                hashes,
+                &leases,
             )
             .expect("submit load");
         wait_for_load(&load_state, LOAD_WAIT_TIMEOUT).await;
@@ -376,10 +387,11 @@ impl TestEnv {
 
     /// Submit load and assert it fails synchronously with `expected_msg`.
     pub fn expect_load_error(&self, hashes: &[Vec<u8>], expected_msg: &str) {
-        let block_ids: Vec<i32> = (0..hashes.len() as i32).collect();
         let layer_names: Vec<&str> = self.layers.iter().map(|l| l.name.as_str()).collect();
         let load_state = LoadState::new().expect("create LoadState");
         let shm_name = load_state.shm_name().to_string();
+        let block_ids: Vec<i32> = (0..hashes.len() as i32).collect();
+        let leases = vec![("missing-load-lease", block_ids)];
         let err = self
             .engine
             .batch_load_kv_blocks_multi_layer(
@@ -388,8 +400,7 @@ impl TestEnv {
                 0,
                 &shm_name,
                 &layer_names,
-                &block_ids,
-                hashes,
+                &leases,
             )
             .expect_err("load should fail");
         assert!(

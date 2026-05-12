@@ -81,7 +81,7 @@ class LoadIntent:
     """Intent for a KV load operation."""
 
     block_ids: tuple[int, ...]
-    block_hashes: tuple[bytes, ...]
+    load_lease_id: str
     num_tokens: int
 
 

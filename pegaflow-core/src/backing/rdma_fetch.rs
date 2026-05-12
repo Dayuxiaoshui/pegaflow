@@ -1,7 +1,7 @@
 // RDMA remote block fetch: MetaServer query → gRPC QueryBlocksForTransfer → RDMA READ.
 //
 // Follows the same submit/oneshot pattern as SsdBackingStore::submit_prefix so that
-// PrefetchScheduler can treat remote fetch the same way it treats SSD prefetch.
+// LoadReservationScheduler can treat remote fetch the same way it treats SSD prefetch.
 
 use std::collections::HashMap;
 use std::ptr::NonNull;

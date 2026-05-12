@@ -31,7 +31,7 @@ class TestEngineClientQuery:
 
     def test_query_empty_hashes(self, engine_client, registered_instance: str):
         """Query with empty hashes should succeed."""
-        result = engine_client.query_prefetch(registered_instance, [], req_id="test")
+        result = engine_client.reserve_load(registered_instance, [], request_id="test")
 
         assert isinstance(result, dict)
         assert "hit_blocks" in result or "ok" in result
@@ -40,7 +40,9 @@ class TestEngineClientQuery:
         self, engine_client, registered_instance: str, block_hashes: list[bytes]
     ):
         """Query for unknown hashes should return zero hits (miss)."""
-        result = engine_client.query_prefetch(registered_instance, block_hashes[:5], req_id="test")
+        result = engine_client.reserve_load(
+            registered_instance, block_hashes[:5], request_id="test"
+        )
 
         assert isinstance(result, dict)
         hit_blocks = result.get("hit_blocks", 0)
@@ -50,5 +52,7 @@ class TestEngineClientQuery:
         self, engine_client, registered_instance: str, block_hashes: list[bytes]
     ):
         """Query with a single hash."""
-        result = engine_client.query_prefetch(registered_instance, block_hashes[:1], req_id="test")
+        result = engine_client.reserve_load(
+            registered_instance, block_hashes[:1], request_id="test"
+        )
         assert result is not None

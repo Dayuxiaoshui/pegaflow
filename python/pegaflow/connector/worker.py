@@ -342,12 +342,13 @@ class WorkerConnector:
         load_start = time.perf_counter()
 
         all_block_ids: list[int] = []
-        all_block_hashes: list[bytes] = []
+        leases: list[tuple[str, list[int]]] = []
         request_ids: list[str] = []
 
         for req_id, load_intent in metadata.load_intents.items():
-            all_block_ids.extend(load_intent.block_ids)
-            all_block_hashes.extend(load_intent.block_hashes)
+            block_ids = list(load_intent.block_ids)
+            all_block_ids.extend(block_ids)
+            leases.append((load_intent.load_lease_id, block_ids))
             request_ids.append(req_id)
 
         if not all_block_ids:
@@ -374,8 +375,7 @@ class WorkerConnector:
                 self._ctx.device_id,
                 shm_name,
                 target_layers,
-                all_block_ids,
-                all_block_hashes,
+                leases,
             )
         except Exception as e:
             logger.error(

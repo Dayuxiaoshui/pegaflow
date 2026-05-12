@@ -32,8 +32,8 @@ pub(crate) struct CoreMetrics {
     pub cache_resident_bytes: UpDownCounter<i64>,
     pub cache_block_hits: Counter<u64>,
     pub cache_block_misses: Counter<u64>,
-    /// Per-decision block attribution for `query_prefetch`. Labelled by `tier`
-    /// (`ram` | `rdma` | `ssd` | `miss`). Each `query_prefetch` decision adds
+    /// Per-decision block attribution for `reserve_load`. Labelled by `tier`
+    /// (`ram` | `rdma` | `ssd` | `miss`). Each `reserve_load` decision adds
     /// at most four times (one per non-zero tier) and the sum across tiers
     /// equals the request's `block_hashes.len()`.
     pub cache_tier_block_requests: Counter<u64>,
@@ -43,8 +43,8 @@ pub(crate) struct CoreMetrics {
     pub cache_block_evictions_still_referenced: Counter<u64>,
     pub cache_eviction_reclaimed_bytes: Counter<u64>,
 
-    // Read-path pins (prevents eviction between prefix check and load)
-    pub pinned_for_load_unique_bytes: UpDownCounter<i64>,
+    // Read-path load leases (prevents eviction between reservation and load)
+    pub leased_for_load_unique_bytes: UpDownCounter<i64>,
 
     // GPU <-> CPU transfer
     pub save_bytes: Counter<u64>,
@@ -230,7 +230,7 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
             cache_tier_block_requests: meter
                 .u64_counter("pegaflow_cache_tier_block_requests")
                 .with_description(
-                    "Per-decision query_prefetch block attribution by storage tier \
+                    "Per-decision reserve_load block attribution by storage tier \
                      (tier=ram|rdma|ssd|miss). The sum across tiers equals the \
                      request's block count for that decision. This is decision \
                      attribution, not service attribution; backing failures must be \
@@ -260,11 +260,11 @@ pub(crate) fn core_metrics() -> &'static CoreMetrics {
                 .with_description("Estimated bytes actually reclaimed in pinned allocator after cache eviction")
                 .build(),
 
-            // Pins
-            pinned_for_load_unique_bytes: meter
-                .i64_up_down_counter("pegaflow_pinned_for_load_unique_bytes")
+            // Load leases
+            leased_for_load_unique_bytes: meter
+                .i64_up_down_counter("pegaflow_leased_for_load_unique_bytes")
                 .with_unit("bytes")
-                .with_description("Current bytes referenced by pinned_for_load (unique blocks; sum of footprints)")
+                .with_description("Current bytes referenced by load leases (unique blocks; sum of footprints)")
                 .build(),
 
             // Transfer

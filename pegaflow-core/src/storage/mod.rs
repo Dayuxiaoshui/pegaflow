@@ -15,14 +15,14 @@ use crate::backing::{
     AllocateFn, DEFAULT_MAX_PREFETCH_BLOCKS, RdmaFetchStore, RdmaTransport, SsdBackingStore,
     SsdCacheConfig,
 };
-use crate::block::{BlockKey, PrefetchStatus, SealedBlock};
+use crate::block::{BlockKey, ReserveLoadStatus, SealedBlock};
 use crate::internode::MetaServerClient;
 use crate::internode::metaserver_client::MetaServerClientConfig;
 use crate::metrics::core_metrics;
 use crate::pinned_pool::{PinnedAllocation, PinnedAllocator};
 use pegaflow_common::NumaNode;
 
-use prefetch::PrefetchScheduler;
+use prefetch::LoadReservationScheduler;
 use read_cache::ReadCache;
 use write_path::{InsertDeps, WritePipeline};
 
@@ -87,7 +87,7 @@ impl Default for StorageConfig {
 pub(crate) struct StorageEngine {
     allocator: Arc<PinnedAllocator>,
     read_cache: Arc<ReadCache>,
-    prefetch: PrefetchScheduler,
+    load_reservations: LoadReservationScheduler,
     write_pipeline: Arc<WritePipeline>,
     ssd_store: Option<Arc<SsdBackingStore>>,
     rdma_transport: Option<Arc<RdmaTransport>>,
@@ -206,8 +206,8 @@ impl StorageEngine {
                 )))
             });
 
-            let prefetch =
-                PrefetchScheduler::new(ssd_store.clone(), rdma_fetch, max_prefetch_blocks);
+            let load_reservations =
+                LoadReservationScheduler::new(ssd_store.clone(), rdma_fetch, max_prefetch_blocks);
 
             let transfer_lock = Arc::new(transfer_lock::TransferLockManager::new(
                 transfer_lock_timeout,
@@ -216,7 +216,7 @@ impl StorageEngine {
             Self {
                 allocator,
                 read_cache: read_cache.clone(),
-                prefetch,
+                load_reservations,
                 write_pipeline: write_pipeline.clone(),
                 ssd_store,
                 rdma_transport,
@@ -341,31 +341,19 @@ impl StorageEngine {
         }
     }
 
-    /// Consume pinned blocks for a load operation (each consumes one pin reservation).
-    pub(crate) fn consume_pinned_blocks(
+    /// Consume a load lease for one worker load operation.
+    pub(crate) fn consume_load_lease(
         &self,
         instance_id: &str,
-        namespace: &str,
-        block_hashes: &[Vec<u8>],
+        load_lease_id: &str,
     ) -> Result<Vec<Arc<SealedBlock>>, String> {
         self.read_cache
-            .consume_pinned_blocks(instance_id, namespace, block_hashes)
+            .consume_load_lease(instance_id, load_lease_id)
     }
 
-    /// Unpin multiple refs for each block hash in one cancellation operation.
-    pub(crate) fn unpin_block_refs(
-        &self,
-        instance_id: &str,
-        namespace: &str,
-        block_hashes: &[Vec<u8>],
-        release_refs_per_hash: usize,
-    ) -> usize {
-        self.read_cache.unpin_block_refs(
-            instance_id,
-            namespace,
-            block_hashes,
-            release_refs_per_hash,
-        )
+    /// Release a load lease in one cancellation operation.
+    pub(crate) fn release_load_lease(&self, load_lease_id: &str) -> bool {
+        self.read_cache.release_load_lease(load_lease_id)
     }
 
     /// Evict all blocks from the resident in-memory read cache.
@@ -435,17 +423,17 @@ impl StorageEngine {
         }
     }
 
-    /// Check prefix blocks and schedule backing-store reads if needed.
-    pub(crate) async fn check_prefix_and_prefetch(
+    /// Reserve prefix blocks for load, scheduling backing-store reads when needed.
+    pub(crate) async fn reserve_load(
         &self,
         instance_id: &str,
         req_id: &str,
         namespace: &str,
         hashes: &[Vec<u8>],
         num_workers: usize,
-    ) -> PrefetchStatus {
-        self.prefetch
-            .check_and_prefetch(
+    ) -> ReserveLoadStatus {
+        self.load_reservations
+            .reserve_load(
                 &self.read_cache,
                 instance_id,
                 req_id,
@@ -550,7 +538,9 @@ impl StorageEngine {
             .write_pipeline
             .gc_stale_inflight(inflight_max_age)
             .await;
-        let failed = self.prefetch.gc_failed_remote(failed_remote_max_age);
+        let failed = self
+            .load_reservations
+            .gc_failed_remote(failed_remote_max_age);
         if failed > 0 {
             log::debug!("gc: cleared {failed} stale failed_remote entries");
         }
@@ -612,11 +602,6 @@ impl StorageEngine {
     pub(crate) fn test_insert_cache(&self, key: BlockKey, block: Arc<SealedBlock>) {
         self.read_cache.batch_insert(vec![(key, block)]);
     }
-
-    /// Get the pin refcount for a (instance, block) pair (test only).
-    pub(crate) fn test_pin_count(&self, instance_id: &str, key: &BlockKey) -> usize {
-        self.read_cache.pin_count(instance_id, key)
-    }
 }
 
 #[cfg(test)]
@@ -637,68 +622,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pin_consume_releases_immediately() {
+    async fn lease_consume_releases_immediately() {
         let storage = make_engine();
         let key = BlockKey::new("ns".into(), vec![1]);
         let block = Arc::new(SealedBlock::from_slots(Vec::new()));
 
-        // Insert into cache, then pin
+        // Insert into cache, then reserve a load lease.
         storage.test_insert_cache(key.clone(), block.clone());
-        storage
+        let lease = storage
             .read_cache
-            .pin_blocks("inst1", 1, &[(key.clone(), block)]);
-
-        assert_eq!(storage.test_pin_count("inst1", &key), 1);
-
-        // consume_pinned_blocks transfers Arc ownership and consumes the reservation
-        let blocks = storage
-            .consume_pinned_blocks("inst1", "ns", &[vec![1]])
+            .create_load_lease("inst1", 1, &[(key.clone(), block)])
             .unwrap();
+
+        // consume_load_lease transfers Arc ownership and consumes the reservation
+        let blocks = storage.consume_load_lease("inst1", &lease).unwrap();
         assert_eq!(blocks.len(), 1);
 
         // Reservation is consumed immediately on lookup
-        assert_eq!(storage.test_pin_count("inst1", &key), 0);
+        assert!(storage.consume_load_lease("inst1", &lease).is_err());
     }
 
     #[tokio::test]
-    async fn unpin_blocks_cancellation_path() {
+    async fn release_load_lease_cancellation_path() {
         let storage = make_engine();
         let key = BlockKey::new("ns".into(), vec![1]);
         let block = Arc::new(SealedBlock::from_slots(Vec::new()));
 
         storage.test_insert_cache(key.clone(), block.clone());
-        storage
+        let lease = storage
             .read_cache
-            .pin_blocks("inst1", 2, &[(key.clone(), block)]);
+            .create_load_lease("inst1", 2, &[(key.clone(), block)])
+            .unwrap();
 
-        assert_eq!(storage.test_pin_count("inst1", &key), 2);
+        assert!(storage.release_load_lease(&lease));
 
-        // Unpin once (simulating one worker cancellation)
-        let unpinned = storage.unpin_block_refs("inst1", "ns", &[vec![1]], 1);
-        assert_eq!(unpinned, 1);
-        assert_eq!(storage.test_pin_count("inst1", &key), 1);
-
-        // Unpin again
-        let unpinned = storage.unpin_block_refs("inst1", "ns", &[vec![1]], 1);
-        assert_eq!(unpinned, 1);
-        assert_eq!(storage.test_pin_count("inst1", &key), 0);
+        // Idempotent release.
+        assert!(!storage.release_load_lease(&lease));
+        assert!(storage.consume_load_lease("inst1", &lease).is_err());
     }
 
     #[tokio::test]
-    async fn unpin_block_refs_releases_multiple_worker_refs() {
+    async fn release_load_lease_releases_multiple_worker_refs() {
         let storage = make_engine();
         let key = BlockKey::new("ns".into(), vec![1]);
         let block = Arc::new(SealedBlock::from_slots(Vec::new()));
 
         storage.test_insert_cache(key.clone(), block.clone());
-        storage
+        let lease = storage
             .read_cache
-            .pin_blocks("inst1", 3, &[(key.clone(), block)]);
-        assert_eq!(storage.test_pin_count("inst1", &key), 3);
-
-        let unpinned = storage.unpin_block_refs("inst1", "ns", &[vec![1]], 3);
-        assert_eq!(unpinned, 3);
-        assert_eq!(storage.test_pin_count("inst1", &key), 0);
+            .create_load_lease("inst1", 3, &[(key.clone(), block)])
+            .unwrap();
+        assert!(storage.release_load_lease(&lease));
+        assert!(storage.consume_load_lease("inst1", &lease).is_err());
     }
 
     #[tokio::test]
@@ -753,29 +728,20 @@ mod tests {
 
         storage.test_insert_cache(key.clone(), block.clone());
         // Pin for 3 workers
-        storage
+        let lease = storage
             .read_cache
-            .pin_blocks("inst1", 3, &[(key.clone(), block)]);
-        assert_eq!(storage.test_pin_count("inst1", &key), 3);
-
+            .create_load_lease("inst1", 3, &[(key.clone(), block)])
+            .unwrap();
         // Worker 0 consumes
-        let blocks_0 = storage
-            .consume_pinned_blocks("inst1", "ns", &[vec![1]])
-            .unwrap();
+        let blocks_0 = storage.consume_load_lease("inst1", &lease).unwrap();
         assert_eq!(blocks_0.len(), 1);
-        assert_eq!(storage.test_pin_count("inst1", &key), 2);
         // Worker 1 consumes
-        let blocks_1 = storage
-            .consume_pinned_blocks("inst1", "ns", &[vec![1]])
-            .unwrap();
+        let blocks_1 = storage.consume_load_lease("inst1", &lease).unwrap();
         assert_eq!(blocks_1.len(), 1);
-        assert_eq!(storage.test_pin_count("inst1", &key), 1);
         // Worker 2 consumes
-        let blocks_2 = storage
-            .consume_pinned_blocks("inst1", "ns", &[vec![1]])
-            .unwrap();
+        let blocks_2 = storage.consume_load_lease("inst1", &lease).unwrap();
         assert_eq!(blocks_2.len(), 1);
-        assert_eq!(storage.test_pin_count("inst1", &key), 0);
+        assert!(storage.consume_load_lease("inst1", &lease).is_err());
 
         // The owned Arcs can outlive reservation accounting.
         assert_eq!(blocks_0.len() + blocks_1.len() + blocks_2.len(), 3);
@@ -800,10 +766,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consume_missing_pin_returns_error() {
+    async fn consume_missing_lease_returns_error() {
         let storage = make_engine();
-        // No pins exist — consume should fail
-        let result = storage.consume_pinned_blocks("inst1", "ns", &[vec![1]]);
+        // No lease exists — consume should fail.
+        let result = storage.consume_load_lease("inst1", "missing-load-lease");
         assert!(result.is_err());
     }
 

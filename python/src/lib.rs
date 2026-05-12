@@ -1,8 +1,8 @@
 use pegaflow_core::LoadState;
 use pegaflow_proto::proto::engine::{
-    HealthRequest, LoadRequest, QueryRequest, RegisterContextRequest, ResponseStatus, SaveLayer,
-    SaveRequest, SessionEvent, SessionRequest, ShutdownRequest, UnpinRequest, UnregisterRequest,
-    engine_client::EngineClient,
+    HealthRequest, LoadLeaseBlocks, LoadRequest, RegisterContextRequest, ReleaseLoadLeaseRequest,
+    ReserveLoadRequest, ResponseStatus, SaveLayer, SaveRequest, SessionEvent, SessionRequest,
+    ShutdownRequest, UnregisterRequest, engine_client::EngineClient,
 };
 use pyo3::{
     create_exception,
@@ -306,8 +306,7 @@ impl EngineRpcClient {
     ///     device_id: CUDA device ID
     ///     load_state_shm: Shared memory name for load state sync
     ///     layer_names: List of layer names to load
-    ///     block_ids: GPU block IDs to load into
-    ///     block_hashes: Content hashes for blocks
+    ///     leases: List of (load_lease_id, block_ids) tuples
     ///
     /// Returns: (ok: bool, message: str)
     #[allow(
@@ -322,10 +321,16 @@ impl EngineRpcClient {
         device_id: i32,
         load_state_shm: String,
         layer_names: Vec<String>,
-        block_ids: Vec<i32>,
-        block_hashes: Vec<Vec<u8>>,
+        leases: Vec<(String, Vec<i32>)>,
     ) -> PyResult<(bool, String)> {
         self.call(py, "load", |mut c| async move {
+            let leases = leases
+                .into_iter()
+                .map(|(load_lease_id, block_ids)| LoadLeaseBlocks {
+                    load_lease_id,
+                    block_ids,
+                })
+                .collect();
             let resp = c
                 .load(LoadRequest {
                     instance_id,
@@ -333,8 +338,7 @@ impl EngineRpcClient {
                     device_id,
                     load_state_shm,
                     layer_names,
-                    block_ids,
-                    block_hashes,
+                    leases,
                 })
                 .await?;
             Ok(resp.into_inner())
@@ -342,10 +346,9 @@ impl EngineRpcClient {
         .and_then(|r| status_tuple("load", r.status))
     }
 
-    /// Query prefix cache hits with SSD prefetch support.
+    /// Reserve prefix cache hits for a later load.
     ///
-    /// Checks memory cache and triggers SSD prefetch for missing blocks.
-    /// Pins hit blocks for subsequent load operations.
+    /// Checks memory cache and triggers prefetch for missing backing blocks.
     ///
     /// Args:
     ///     instance_id: Model instance ID
@@ -355,38 +358,35 @@ impl EngineRpcClient {
     ///     - ok: bool - whether the request succeeded
     ///     - message: str - error message if failed
     ///     - hit_blocks: int - number of blocks ready in cache
-    ///     - prefetch_state: str - one of "done", "loading"
-    ///     - loading_blocks: int - number of blocks being prefetched
-    ///     - missing_blocks: int - number of blocks not found
-    fn query_prefetch(
+    ///     - state: str - one of "ready", "loading"
+    ///     - load_lease_id: str - UUID set when state is "ready" and hit_blocks > 0
+    fn reserve_load(
         &self,
         py: Python<'_>,
         instance_id: String,
         block_hashes: Vec<Vec<u8>>,
-        req_id: String,
+        request_id: String,
     ) -> PyResult<Py<pyo3::types::PyAny>> {
-        use pegaflow_proto::proto::engine::PrefetchState;
+        use pegaflow_proto::proto::engine::ReserveLoadState;
 
-        self.call(py, "query_prefetch", |mut c| async move {
+        self.call(py, "reserve_load", |mut c| async move {
             let resp = c
-                .query_prefetch(QueryRequest {
+                .reserve_load(ReserveLoadRequest {
                     instance_id,
                     block_hashes,
-                    req_id,
+                    request_id,
                 })
                 .await?;
             Ok(resp.into_inner())
         })
         .and_then(|r| {
-            let (ok, msg) = status_tuple("query_prefetch", r.status)?;
+            let (ok, msg) = status_tuple("reserve_load", r.status)?;
             let hit = u64_to_usize(r.hit_blocks, "hit_blocks")?;
-            let loading = u64_to_usize(r.loading_blocks, "loading_blocks")?;
-            let missing = u64_to_usize(r.missing_blocks, "missing_blocks")?;
 
-            let prefetch_state = match PrefetchState::try_from(r.prefetch_state) {
-                Ok(PrefetchState::PrefetchDone) => "done",
-                Ok(PrefetchState::PrefetchLoading) => "loading",
-                _ => "done", // Default to done for unknown states
+            let state = match ReserveLoadState::try_from(r.state) {
+                Ok(ReserveLoadState::Ready) => "ready",
+                Ok(ReserveLoadState::Loading) => "loading",
+                _ => "ready",
             };
 
             Python::attach(|py| {
@@ -395,43 +395,26 @@ impl EngineRpcClient {
                 dict.set_item("ok", ok)?;
                 dict.set_item("message", msg)?;
                 dict.set_item("hit_blocks", hit)?;
-                dict.set_item("prefetch_state", prefetch_state)?;
-                dict.set_item("loading_blocks", loading)?;
-                dict.set_item("missing_blocks", missing)?;
+                dict.set_item("state", state)?;
+                dict.set_item("load_lease_id", r.load_lease_id)?;
                 Ok(dict.into())
             })
         })
     }
 
-    /// Unpin blocks that were pinned during query.
-    ///
-    /// This is used when load is cancelled or preempted before consumption.
-    /// Call this to release pinned blocks and prevent memory leaks.
-    ///
-    /// Args:
-    ///     instance_id: Model instance ID
-    ///     block_hashes: List of block hashes to unpin
-    ///     release_refs_per_hash: Number of pin refs to release for each hash
-    ///
-    /// Returns: (ok: bool, message: str)
-    fn unpin(
+    /// Release a load lease that will not be consumed.
+    fn release_load_lease(
         &self,
         py: Python<'_>,
-        instance_id: String,
-        block_hashes: Vec<Vec<u8>>,
-        release_refs_per_hash: u32,
+        load_lease_id: String,
     ) -> PyResult<(bool, String)> {
-        self.call(py, "unpin", |mut c| async move {
+        self.call(py, "release_load_lease", |mut c| async move {
             let resp = c
-                .unpin(UnpinRequest {
-                    instance_id,
-                    block_hashes,
-                    release_refs_per_hash,
-                })
+                .release_load_lease(ReleaseLoadLeaseRequest { load_lease_id })
                 .await?;
             Ok(resp.into_inner())
         })
-        .and_then(|r| status_tuple("unpin", r.status))
+        .and_then(|r| status_tuple("release_load_lease", r.status))
     }
 
     /// Unregister a context/instance.

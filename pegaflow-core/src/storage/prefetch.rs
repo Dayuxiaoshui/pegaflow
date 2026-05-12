@@ -1,5 +1,5 @@
-// Per-request prefetch state machine. A single Mutex is sufficient because
-// prefetch operations are per-query (low frequency, never a bottleneck).
+// Per-request load reservation state machine. A single Mutex is sufficient
+// because reserve-load operations are per-query and not a hot data-copy path.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -10,7 +10,7 @@ use mea::oneshot;
 use parking_lot::Mutex;
 
 use crate::backing::{PrefetchResult, RdmaFetchStore, SsdBackingStore};
-use crate::block::{BlockKey, PrefetchStatus};
+use crate::block::{BlockKey, ReserveLoadStatus};
 use crate::metrics::core_metrics;
 
 use super::read_cache::ReadCache;
@@ -19,12 +19,12 @@ use super::tier_attribution::{
 };
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum PrefetchSource {
+enum BackingSource {
     Ssd,
     Rdma,
 }
 
-impl PrefetchSource {
+impl BackingSource {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Ssd => "ssd",
@@ -40,40 +40,40 @@ impl PrefetchSource {
     }
 }
 
-struct PrefetchEntry {
+struct BackingFetchEntry {
     blocks_rx: oneshot::Receiver<PrefetchResult>,
     loading_count: usize,
-    source: PrefetchSource,
+    source: BackingSource,
 }
 
-/// Result of a single load attempt (SSD or RDMA).
-struct LoadResult {
+/// Result of a single backing fetch attempt (SSD or RDMA).
+struct BackingFetch {
     found: usize,
     rx: oneshot::Receiver<PrefetchResult>,
-    source: PrefetchSource,
+    source: BackingSource,
 }
 
-struct PrefixScan<'a> {
+struct ReserveLoadScan<'a> {
     instance_id: &'a str,
-    req_id: &'a str,
+    request_id: &'a str,
     namespace: &'a str,
     hashes: &'a [Vec<u8>],
     num_workers: usize,
     emit_tier_metrics: bool,
 }
 
-struct PrefetchState {
-    active: HashMap<String, PrefetchEntry>,
+struct ReservationState {
+    active: HashMap<String, BackingFetchEntry>,
     /// Invariant: `inflight_count == active.values().map(|e| e.loading_count).sum()`
     inflight_count: usize,
-    /// req_ids where RDMA remote fetch returned zero blocks (remote evicted).
+    /// request_ids where RDMA remote fetch returned zero blocks (remote evicted).
     /// Prevents re-triggering RDMA on every subsequent poll for the same request.
     failed_remote: HashMap<String, Instant>,
 }
 
-impl PrefetchState {
-    fn remove_entry(&mut self, req_id: &str) -> Option<PrefetchEntry> {
-        if let Some(entry) = self.active.remove(req_id) {
+impl ReservationState {
+    fn remove_entry(&mut self, request_id: &str) -> Option<BackingFetchEntry> {
+        if let Some(entry) = self.active.remove(request_id) {
             self.inflight_count = self.inflight_count.saturating_sub(entry.loading_count);
             Some(entry)
         } else {
@@ -82,21 +82,21 @@ impl PrefetchState {
     }
 }
 
-pub(super) struct PrefetchScheduler {
-    state: Mutex<PrefetchState>,
+pub(super) struct LoadReservationScheduler {
+    state: Mutex<ReservationState>,
     ssd_store: Option<Arc<SsdBackingStore>>,
     rdma_fetch: Option<Arc<RdmaFetchStore>>,
     max_prefetch_blocks: usize,
 }
 
-impl PrefetchScheduler {
+impl LoadReservationScheduler {
     pub(super) fn new(
         ssd_store: Option<Arc<SsdBackingStore>>,
         rdma_fetch: Option<Arc<RdmaFetchStore>>,
         max_prefetch_blocks: usize,
     ) -> Self {
         Self {
-            state: Mutex::new(PrefetchState {
+            state: Mutex::new(ReservationState {
                 active: HashMap::new(),
                 inflight_count: 0,
                 failed_remote: HashMap::new(),
@@ -107,21 +107,21 @@ impl PrefetchScheduler {
         }
     }
 
-    pub(super) async fn check_and_prefetch(
+    pub(super) async fn reserve_load(
         &self,
         read_cache: &ReadCache,
         instance_id: &str,
-        req_id: &str,
+        request_id: &str,
         namespace: &str,
         hashes: &[Vec<u8>],
         num_workers: usize,
-    ) -> PrefetchStatus {
+    ) -> ReserveLoadStatus {
         // Default: this call may be the first decision and should attribute.
         let mut emit_tier_metrics = true;
-        if let Some(status) = self.poll_existing(read_cache, req_id) {
+        if let Some(status) = self.poll_existing(read_cache, request_id) {
             match status {
                 PollResult::StillLoading => {
-                    return PrefetchStatus::Loading { hit: 0, loading: 1 };
+                    return ReserveLoadStatus::Loading { hit: 0 };
                 }
                 PollResult::Completed => {
                     // Backing has just written blocks into read_cache. The
@@ -135,9 +135,9 @@ impl PrefetchScheduler {
 
         self.full_prefix_scan(
             read_cache,
-            PrefixScan {
+            ReserveLoadScan {
                 instance_id,
-                req_id,
+                request_id,
                 namespace,
                 hashes,
                 num_workers,
@@ -147,28 +147,28 @@ impl PrefetchScheduler {
         .await
     }
 
-    fn poll_existing(&self, read_cache: &ReadCache, req_id: &str) -> Option<PollResult> {
+    fn poll_existing(&self, read_cache: &ReadCache, request_id: &str) -> Option<PollResult> {
         let mut state = self.state.lock();
-        let entry = state.active.get_mut(req_id)?;
+        let entry = state.active.get_mut(request_id)?;
 
         match entry.blocks_rx.try_recv() {
             Err(oneshot::TryRecvError::Empty) => Some(PollResult::StillLoading),
             Ok(prefetched_blocks) => {
                 let expected = entry.loading_count;
                 let source = entry.source;
-                state.remove_entry(req_id);
+                state.remove_entry(request_id);
                 // RDMA remote node can return fewer blocks than MetaServer promised
                 // (likely evicted). Don't re-trigger RDMA on subsequent scans.
-                if source == PrefetchSource::Rdma
+                if source == BackingSource::Rdma
                     && prefetched_blocks.len() < expected
                     && expected > 0
                 {
                     state
                         .failed_remote
-                        .insert(req_id.to_string(), Instant::now());
+                        .insert(request_id.to_string(), Instant::now());
                     info!(
-                        "RDMA prefetch returned fewer blocks than expected: req_id={} returned={} expected={}",
-                        req_id,
+                        "RDMA prefetch returned fewer blocks than expected: request_id={} returned={} expected={}",
+                        request_id,
                         prefetched_blocks.len(),
                         expected
                     );
@@ -179,10 +179,10 @@ impl PrefetchScheduler {
             }
             Err(oneshot::TryRecvError::Disconnected) => {
                 warn!(
-                    "Backing prefetch sender dropped for req_id={}, falling back to re-scan",
-                    req_id
+                    "Backing prefetch sender dropped for request_id={}, falling back to re-scan",
+                    request_id
                 );
-                state.remove_entry(req_id);
+                state.remove_entry(request_id);
                 Some(PollResult::Completed)
             }
         }
@@ -191,8 +191,8 @@ impl PrefetchScheduler {
     async fn full_prefix_scan(
         &self,
         read_cache: &ReadCache,
-        scan: PrefixScan<'_>,
-    ) -> PrefetchStatus {
+        scan: ReserveLoadScan<'_>,
+    ) -> ReserveLoadStatus {
         let total_start = Instant::now();
 
         let key_build_start = Instant::now();
@@ -204,20 +204,22 @@ impl PrefetchScheduler {
         let key_build = key_build_start.elapsed();
 
         let cache_scan_start = Instant::now();
-        let (hit, blocks_to_pin) = read_cache.get_prefix_blocks(&keys);
+        let (hit, blocks_to_lease) = read_cache.get_prefix_blocks(&keys);
         let cache_scan = cache_scan_start.elapsed();
         let remaining = &keys[hit..];
 
-        let load_select_start = Instant::now();
-        let load = self.try_load(scan.req_id, scan.namespace, remaining).await;
-        let load_select = load_select_start.elapsed();
+        let fetch_select_start = Instant::now();
+        let load = self
+            .try_backing_fetch(scan.request_id, scan.namespace, remaining)
+            .await;
+        let fetch_select = fetch_select_start.elapsed();
         let loading = load.as_ref().map_or(0, |l| l.found);
         let missing = keys.len() - hit - loading;
 
         if let Some(load) = load {
             let source = load.source;
             let register_start = Instant::now();
-            self.register_inflight(scan.req_id, load);
+            self.register_backing_fetch(scan.request_id, load);
             let register = register_start.elapsed();
 
             self.maybe_record_tier_attribution(
@@ -229,8 +231,8 @@ impl PrefetchScheduler {
             );
 
             info!(
-                "Prefetch scheduling timing: req_id={} source={} total_keys={} hit={} loading={} missing={} key_build={:?} cache_scan={:?} load_select={:?} register_inflight={:?} total={:?}",
-                scan.req_id,
+                "Reserve-load backing timing: request_id={} source={} total_keys={} hit={} loading={} missing={} key_build={:?} cache_scan={:?} fetch_select={:?} register_backing_fetch={:?} total={:?}",
+                scan.request_id,
                 source.as_str(),
                 keys.len(),
                 hit,
@@ -238,15 +240,17 @@ impl PrefetchScheduler {
                 missing,
                 key_build,
                 cache_scan,
-                load_select,
+                fetch_select,
                 register,
                 total_start.elapsed()
             );
-            PrefetchStatus::Loading { hit, loading }
+            ReserveLoadStatus::Loading { hit }
         } else {
-            let pin_start = Instant::now();
-            read_cache.pin_blocks(scan.instance_id, scan.num_workers, &blocks_to_pin);
-            let pin = pin_start.elapsed();
+            let lease_start = Instant::now();
+            let lease_id = read_cache
+                .create_load_lease(scan.instance_id, scan.num_workers, &blocks_to_lease)
+                .unwrap_or_default();
+            let lease = lease_start.elapsed();
 
             self.maybe_record_tier_attribution(
                 keys.len(),
@@ -257,22 +261,26 @@ impl PrefetchScheduler {
             );
 
             info!(
-                "Prefetch local-hit timing: req_id={} total_keys={} hit={} missing={} key_build={:?} cache_scan={:?} load_select={:?} pin={:?} total={:?}",
-                scan.req_id,
+                "Reserve-load local timing: request_id={} total_keys={} hit={} missing={} key_build={:?} cache_scan={:?} fetch_select={:?} lease={:?} total={:?}",
+                scan.request_id,
                 keys.len(),
                 hit,
                 missing,
                 key_build,
                 cache_scan,
-                load_select,
-                pin,
+                fetch_select,
+                lease,
                 total_start.elapsed()
             );
-            PrefetchStatus::Done { hit, missing }
+            ReserveLoadStatus::Ready {
+                hit,
+                missing,
+                lease_id,
+            }
         }
     }
 
-    /// Attribute this `query_prefetch` decision. Skips attribution when:
+    /// Attribute this `reserve_load` decision. Skips attribution when:
     /// * `emit_tier_metrics == false` (e.g. post-completion fall-through);
     /// * `keys` was empty (no decision to attribute).
     fn maybe_record_tier_attribution(
@@ -291,24 +299,24 @@ impl PrefetchScheduler {
     }
 
     /// Priority fallback: RDMA -> SSD. Returns `None` when neither source has blocks.
-    async fn try_load(
+    async fn try_backing_fetch(
         &self,
-        req_id: &str,
+        request_id: &str,
         namespace: &str,
         remaining: &[BlockKey],
-    ) -> Option<LoadResult> {
+    ) -> Option<BackingFetch> {
         if remaining.is_empty() {
             return None;
         }
 
-        if let Some(result) = self.try_rdma_load(req_id, namespace, remaining).await {
+        if let Some(result) = self.try_rdma_fetch(request_id, namespace, remaining).await {
             return Some(result);
         }
 
-        self.try_ssd_load(remaining)
+        self.try_ssd_fetch(remaining)
     }
 
-    fn try_ssd_load(&self, remaining: &[BlockKey]) -> Option<LoadResult> {
+    fn try_ssd_fetch(&self, remaining: &[BlockKey]) -> Option<BackingFetch> {
         let ssd = self.ssd_store.as_ref()?;
         let check_keys = self.limit_ssd_prefetch(remaining)?;
 
@@ -317,34 +325,34 @@ impl PrefetchScheduler {
             return None;
         }
 
-        Some(LoadResult {
+        Some(BackingFetch {
             found,
             rx,
-            source: PrefetchSource::Ssd,
+            source: BackingSource::Ssd,
         })
     }
 
-    async fn try_rdma_load(
+    async fn try_rdma_fetch(
         &self,
-        req_id: &str,
+        request_id: &str,
         namespace: &str,
         remaining: &[BlockKey],
-    ) -> Option<LoadResult> {
+    ) -> Option<BackingFetch> {
         let rdma = self.rdma_fetch.as_ref()?;
 
-        if self.state.lock().failed_remote.contains_key(req_id) {
+        if self.state.lock().failed_remote.contains_key(request_id) {
             return None;
         }
 
         let hashes: Vec<Vec<u8>> = remaining.iter().map(|k| k.hash.clone()).collect();
         let (node, found) = rdma.query_prefix(namespace, &hashes).await?;
 
-        let rx = rdma.fetch_blocks(&node, req_id, namespace, hashes[..found].to_vec());
+        let rx = rdma.fetch_blocks(&node, request_id, namespace, hashes[..found].to_vec());
 
-        Some(LoadResult {
+        Some(BackingFetch {
             found,
             rx,
-            source: PrefetchSource::Rdma,
+            source: BackingSource::Rdma,
         })
     }
 
@@ -374,21 +382,21 @@ impl PrefetchScheduler {
         Some(remaining[..check_limit].to_vec())
     }
 
-    fn register_inflight(&self, req_id: &str, load: LoadResult) {
+    fn register_backing_fetch(&self, request_id: &str, fetch: BackingFetch) {
         let mut state = self.state.lock();
-        state.inflight_count += load.found;
+        state.inflight_count += fetch.found;
         state.active.insert(
-            req_id.to_string(),
-            PrefetchEntry {
-                blocks_rx: load.rx,
-                loading_count: load.found,
-                source: load.source,
+            request_id.to_string(),
+            BackingFetchEntry {
+                blocks_rx: fetch.rx,
+                loading_count: fetch.found,
+                source: fetch.source,
             },
         );
     }
 
     /// Sweep `failed_remote` entries older than `max_age`.
-    /// Runs under the single `PrefetchState` mutex.
+    /// Runs under the single `ReservationState` mutex.
     pub(super) fn gc_failed_remote(&self, max_age: std::time::Duration) -> usize {
         let mut state = self.state.lock();
         let failed_before = state.failed_remote.len();
