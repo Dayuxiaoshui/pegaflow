@@ -160,9 +160,11 @@ Tier values:
 
 Repeated polls for the same `req_id` do not re-attribute. PegaFlow keeps a
 bounded attribution table with 4096 entries and the same TTL/GC lifecycle as
-`failed_remote`; reusing the same `req_id` inside that TTL window will not
-create another tier attribution. After GC removes the entry, the same `req_id`
-is treated as a new logical query.
+`failed_remote`; reusing the same `req_id` will not create another tier
+attribution while its entry is still retained by both TTL and the table cap.
+Under high `req_id` churn, the cap may evict older entries before TTL expiry;
+after GC or cap eviction removes the entry, the same `req_id` is treated as a
+new logical query.
 
 This metric intentionally records decisions, not completed service outcomes.
 For backing failure correlation, use:

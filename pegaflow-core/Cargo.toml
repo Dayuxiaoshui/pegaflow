@@ -10,9 +10,6 @@ workspace = true
 default = ["cudarc/cuda-12080"]
 cuda-13 = ["cudarc/cuda-13000"]
 tracing = ["fastrace"]
-# Internal-only test hooks (tier-attribution spy, etc). Enabled automatically
-# under `cargo test` via dev-dependencies; not intended for downstream use.
-test-utils = []
 
 [dependencies]
 pegaflow-common.workspace = true
@@ -48,7 +45,6 @@ criterion.workspace = true
 cudarc.workspace = true
 tokio.workspace = true
 tempfile = "3"
-pegaflow-core = { path = ".", features = ["test-utils"] }
 
 [[bench]]
 name = "transfer_batch"

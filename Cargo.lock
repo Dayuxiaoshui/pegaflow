@@ -2166,7 +2166,6 @@ dependencies = [
  "opentelemetry",
  "parking_lot",
  "pegaflow-common",
- "pegaflow-core",
  "pegaflow-proto",
  "pegaflow-transfer",
  "rand 0.10.0",

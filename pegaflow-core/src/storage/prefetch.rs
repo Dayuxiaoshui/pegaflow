@@ -1,7 +1,7 @@
 // Per-request prefetch state machine. A single Mutex is sufficient because
 // prefetch operations are per-query (low frequency, never a bottleneck).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -19,8 +19,8 @@ use super::tier_attribution::{
 };
 
 /// Upper bound on `attributed` entries to bound memory under adversarial
-/// `req_id` churn. When full, the oldest entry by `Instant` is evicted to
-/// admit the new one.
+/// `req_id` churn. When full, the oldest retained insertion is evicted to admit
+/// the new one.
 const MAX_ATTRIBUTED_ENTRIES: usize = 4096;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -80,6 +80,9 @@ struct PrefetchState {
     /// Bounded by `MAX_ATTRIBUTED_ENTRIES` and GC'd by TTL alongside
     /// `failed_remote`.
     attributed: HashMap<String, Instant>,
+    /// Insertion order for `attributed`. GC can leave stale keys here; cap
+    /// eviction pops them lazily, so the hot path is amortized O(1).
+    attributed_order: VecDeque<String>,
 }
 
 impl PrefetchState {
@@ -96,26 +99,25 @@ impl PrefetchState {
     /// attribution (caller should emit metrics), `false` if a previous
     /// attribution still lives in the table.
     ///
-    /// Enforces `MAX_ATTRIBUTED_ENTRIES` by evicting the oldest entry on
-    /// overflow. Runs under the `PrefetchState` mutex and never crosses an
-    /// `.await`.
+    /// Enforces `MAX_ATTRIBUTED_ENTRIES` by popping the oldest live req_id from
+    /// `attributed_order` on overflow. Runs under the `PrefetchState` mutex and
+    /// never crosses an `.await`.
     fn try_mark_attributed(&mut self, req_id: &str, now: Instant) -> bool {
         if self.attributed.contains_key(req_id) {
             return false;
         }
         if self.attributed.len() >= MAX_ATTRIBUTED_ENTRIES {
-            // O(N) scan over a bounded table; N <= 4096, runs only on
-            // overflow.
-            if let Some(oldest) = self
-                .attributed
-                .iter()
-                .min_by_key(|(_, ts)| **ts)
-                .map(|(k, _)| k.clone())
-            {
-                self.attributed.remove(&oldest);
+            while self.attributed.len() >= MAX_ATTRIBUTED_ENTRIES {
+                let Some(oldest) = self.attributed_order.pop_front() else {
+                    break;
+                };
+                if self.attributed.remove(&oldest).is_some() {
+                    break;
+                }
             }
         }
         self.attributed.insert(req_id.to_string(), now);
+        self.attributed_order.push_back(req_id.to_string());
         true
     }
 }
@@ -139,6 +141,7 @@ impl PrefetchScheduler {
                 inflight_count: 0,
                 failed_remote: HashMap::new(),
                 attributed: HashMap::new(),
+                attributed_order: VecDeque::new(),
             }),
             ssd_store,
             rdma_fetch,
@@ -341,7 +344,7 @@ impl PrefetchScheduler {
             return;
         }
         let attribution = TierAttribution::classify(total, hit, loading, loading_source);
-        #[cfg(any(test, feature = "test-utils"))]
+        #[cfg(test)]
         super::tier_attribution::test_spy::record(req_id, attribution);
         record_cache_tier_block_requests(total, attribution);
     }
@@ -458,6 +461,12 @@ impl PrefetchScheduler {
         state.failed_remote.retain(|_, ts| ts.elapsed() < max_age);
         let attributed_before = state.attributed.len();
         state.attributed.retain(|_, ts| ts.elapsed() < max_age);
+        let PrefetchState {
+            attributed,
+            attributed_order,
+            ..
+        } = &mut *state;
+        attributed_order.retain(|req_id| attributed.contains_key(req_id));
         (
             failed_before - state.failed_remote.len(),
             attributed_before - state.attributed.len(),
@@ -480,7 +489,12 @@ mod tests {
             inflight_count: 0,
             failed_remote: HashMap::new(),
             attributed: HashMap::new(),
+            attributed_order: VecDeque::new(),
         }
+    }
+
+    fn make_scheduler() -> PrefetchScheduler {
+        PrefetchScheduler::new(None, None, 1024)
     }
 
     #[test]
@@ -504,8 +518,7 @@ mod tests {
     #[test]
     fn try_mark_attributed_evicts_oldest_at_capacity() {
         let mut state = make_state();
-        // Fill to capacity with monotonically increasing timestamps so the
-        // first entry is unambiguously the oldest.
+        // Fill to capacity; the side queue preserves insertion order.
         let base = Instant::now();
         for i in 0..MAX_ATTRIBUTED_ENTRIES {
             // Spread timestamps by 1ns each; `Instant` ordering is well-defined.
@@ -519,5 +532,75 @@ mod tests {
         assert_eq!(state.attributed.len(), MAX_ATTRIBUTED_ENTRIES);
         assert!(!state.attributed.contains_key("req-0"));
         assert!(state.attributed.contains_key("req-new"));
+    }
+
+    #[test]
+    fn try_mark_attributed_stays_bounded_after_capacity() {
+        let mut state = make_state();
+        let now = Instant::now();
+        for i in 0..(MAX_ATTRIBUTED_ENTRIES + 128) {
+            assert!(state.try_mark_attributed(&format!("steady-{i}"), now));
+            assert_eq!(state.attributed.len(), MAX_ATTRIBUTED_ENTRIES.min(i + 1));
+            assert_eq!(
+                state.attributed_order.len(),
+                MAX_ATTRIBUTED_ENTRIES.min(i + 1)
+            );
+        }
+        assert!(!state.attributed.contains_key("steady-0"));
+        assert!(
+            state
+                .attributed
+                .contains_key(&format!("steady-{}", MAX_ATTRIBUTED_ENTRIES + 127))
+        );
+    }
+
+    #[test]
+    fn gc_state_prunes_attributed_order() {
+        let scheduler = make_scheduler();
+        scheduler.maybe_record_tier_attribution("prefetch-gc-order", 4, 4, 0, None, true);
+
+        let (_, attributed_cleaned) = scheduler.gc_state(std::time::Duration::ZERO);
+
+        assert_eq!(attributed_cleaned, 1);
+        let state = scheduler.state.lock();
+        assert!(state.attributed.is_empty());
+        assert!(state.attributed_order.is_empty());
+    }
+
+    #[test]
+    fn maybe_record_tier_attribution_records_once_per_req_id() {
+        let scheduler = make_scheduler();
+        let req_id = "prefetch-record-once";
+
+        scheduler.maybe_record_tier_attribution(req_id, 4, 4, 0, None, true);
+        scheduler.maybe_record_tier_attribution(req_id, 4, 4, 0, None, true);
+
+        let events = super::super::tier_attribution::test_spy::snapshot_for(req_id);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].ram, 4);
+        assert_eq!(events[0].total(), 4);
+    }
+
+    #[test]
+    fn maybe_record_tier_attribution_respects_emit_false() {
+        let scheduler = make_scheduler();
+        let req_id = "prefetch-emit-false";
+
+        scheduler.maybe_record_tier_attribution(req_id, 4, 4, 0, None, false);
+
+        assert!(super::super::tier_attribution::test_spy::snapshot_for(req_id).is_empty());
+    }
+
+    #[test]
+    fn maybe_record_tier_attribution_allows_repeat_after_gc() {
+        let scheduler = make_scheduler();
+        let req_id = "prefetch-repeat-after-gc";
+
+        scheduler.maybe_record_tier_attribution(req_id, 4, 4, 0, None, true);
+        scheduler.gc_state(std::time::Duration::ZERO);
+        scheduler.maybe_record_tier_attribution(req_id, 4, 4, 0, None, true);
+
+        let events = super::super::tier_attribution::test_spy::snapshot_for(req_id);
+        assert_eq!(events.len(), 2);
     }
 }

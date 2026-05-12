@@ -117,28 +117,25 @@ pub(super) fn record_cache_tier_block_requests(total: usize, attribution: TierAt
     }
 }
 
-#[cfg(any(test, feature = "test-utils"))]
-pub mod test_spy {
-    //! Lightweight `cfg(test)` hook used by integration tests to assert the
-    //! number and shape of tier attributions emitted in a scenario, without
-    //! relying on global OTel counter readback.
-    //!
-    //! Strictly compiled out of release builds.
+#[cfg(test)]
+pub(super) mod test_spy {
+    //! Lightweight crate-unit-test hook for asserting tier attribution emission
+    //! counts without relying on global OTel counter readback.
 
     use std::sync::Mutex;
 
     use super::TierAttribution;
 
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-    pub struct Attribution {
-        pub ram: usize,
-        pub rdma: usize,
-        pub ssd: usize,
-        pub miss: usize,
+    pub(in crate::storage) struct Attribution {
+        pub(in crate::storage) ram: usize,
+        pub(in crate::storage) rdma: usize,
+        pub(in crate::storage) ssd: usize,
+        pub(in crate::storage) miss: usize,
     }
 
     impl Attribution {
-        pub fn total(&self) -> usize {
+        pub(in crate::storage) fn total(&self) -> usize {
             self.ram + self.rdma + self.ssd + self.miss
         }
     }
@@ -155,9 +152,9 @@ pub mod test_spy {
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
-    pub struct Event {
-        pub req_id: String,
-        pub attribution: Attribution,
+    pub(in crate::storage) struct Event {
+        pub(in crate::storage) req_id: String,
+        pub(in crate::storage) attribution: Attribution,
     }
 
     static EVENTS: Mutex<Vec<Event>> = Mutex::new(Vec::new());
@@ -172,16 +169,8 @@ pub mod test_spy {
             });
     }
 
-    /// Snapshot the current attribution events without clearing.
-    pub fn snapshot() -> Vec<Event> {
-        EVENTS
-            .lock()
-            .expect("tier_attribution spy poisoned")
-            .clone()
-    }
-
     /// Snapshot events recorded for a single `req_id`.
-    pub fn snapshot_for(req_id: &str) -> Vec<Attribution> {
+    pub(in crate::storage) fn snapshot_for(req_id: &str) -> Vec<Attribution> {
         EVENTS
             .lock()
             .expect("tier_attribution spy poisoned")
@@ -189,15 +178,6 @@ pub mod test_spy {
             .filter(|event| event.req_id == req_id)
             .map(|event| event.attribution)
             .collect()
-    }
-
-    /// Reset the spy. Tests that care about counts should call this before
-    /// running their scenario.
-    pub fn reset() {
-        EVENTS
-            .lock()
-            .expect("tier_attribution spy poisoned")
-            .clear();
     }
 }
 
