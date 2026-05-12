@@ -109,6 +109,9 @@ mod tests {
     #[test]
     fn partial_backing_decisions_keep_selected_tier_and_residual_contract() {
         let cases = [
+            // Done branch: local RAM prefix plus residual miss when no backing
+            // tier is selected for this decision.
+            (TierAttribution::classify(7, 3, 0, None), (3, 0, 0, 4, 7)),
             // RDMA found only part of the non-RAM prefix.
             (
                 TierAttribution::classify(5, 1, 3, Some(AttributionSource::Rdma)),
