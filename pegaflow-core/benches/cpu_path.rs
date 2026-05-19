@@ -23,6 +23,8 @@ const NAMESPACE: &str = "cpu-path";
 const LAYER_NAME: &str = "layer_0";
 const DEVICE_ID: i32 = 0;
 const LOAD_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const FAKE_METASERVER_ADDR: &str = "http://127.0.0.1:9";
+const ADVERTISE_ADDR: &str = "127.0.0.1:50055";
 
 const BLOCK_CASES: &[usize] = &[128, 1024, 8192, 32768];
 const BYTES_PER_BLOCK: usize = 1024;
@@ -36,6 +38,10 @@ struct BenchFixture {
 
 impl BenchFixture {
     fn new(num_blocks: usize, bytes_per_block: usize) -> Self {
+        Self::with_metaserver(num_blocks, bytes_per_block, false)
+    }
+
+    fn with_metaserver(num_blocks: usize, bytes_per_block: usize, enable_metaserver: bool) -> Self {
         let ctx = CudaContext::new(DEVICE_ID as usize).expect("CUDA context");
         ctx.bind_to_thread().expect("bind CUDA context");
 
@@ -58,6 +64,8 @@ impl BenchFixture {
                 enable_lfu_admission: false,
                 hint_value_size_bytes: Some(bytes_per_block),
                 enable_numa_affinity: false,
+                metaserver_addr: enable_metaserver.then(|| FAKE_METASERVER_ADDR.to_string()),
+                advertise_addr: enable_metaserver.then(|| ADVERTISE_ADDR.to_string()),
                 ..StorageConfig::default()
             },
         )
@@ -165,6 +173,41 @@ fn save_flush_benchmarks(c: &mut Criterion) {
         )));
         group.bench_function(BenchmarkId::from_parameter(num_blocks), |b| {
             let fixture = BenchFixture::new(num_blocks, BYTES_PER_BLOCK);
+            b.iter_custom(|iters| {
+                rt.block_on(async {
+                    let mut measured = Duration::ZERO;
+                    for iter in 0..iters {
+                        let hashes = make_block_hashes(num_blocks, iter + 1);
+                        let start = Instant::now();
+                        fixture.save_and_flush(hashes).await;
+                        measured += start.elapsed();
+                        fixture.cleanup_cache();
+                    }
+                    measured
+                })
+            });
+            drop(fixture);
+            std::thread::sleep(Duration::from_millis(50));
+        });
+    }
+
+    group.finish();
+}
+
+fn save_flush_metaserver_benchmarks(c: &mut Criterion) {
+    let rt = Runtime::new().expect("tokio runtime");
+    let mut group = c.benchmark_group("cpu_path/save_flush_unique_metaserver");
+    group.sample_size(10);
+
+    for &num_blocks in BLOCK_CASES {
+        group.throughput(Throughput::Bytes(bytes_per_iter(
+            num_blocks,
+            BYTES_PER_BLOCK,
+        )));
+        group.bench_function(BenchmarkId::from_parameter(num_blocks), |b| {
+            let _guard = rt.enter();
+            let fixture = BenchFixture::with_metaserver(num_blocks, BYTES_PER_BLOCK, true);
+            drop(_guard);
             b.iter_custom(|iters| {
                 rt.block_on(async {
                     let mut measured = Duration::ZERO;
@@ -346,6 +389,7 @@ fn check_cuda(result: sys::CUresult, op: &str) {
 criterion_group!(
     benches,
     save_flush_benchmarks,
+    save_flush_metaserver_benchmarks,
     query_benchmarks,
     load_benchmarks
 );
