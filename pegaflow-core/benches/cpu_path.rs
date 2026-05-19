@@ -241,17 +241,19 @@ impl MultiLayerBenchFixture {
         }
     }
 
-    async fn save_and_flush(&self, hashes: &[Vec<u8>]) {
+    fn make_saves(&self, hashes: &[Vec<u8>]) -> Vec<LayerSave> {
         let ids = block_ids(self.num_blocks);
-        let saves: Vec<LayerSave> = self
-            .layer_names
+        self.layer_names
             .iter()
             .map(|layer_name| LayerSave {
                 layer_name: layer_name.clone(),
                 block_ids: ids.clone(),
                 block_hashes: hashes.to_vec(),
             })
-            .collect();
+            .collect()
+    }
+
+    async fn save_and_flush(&self, saves: Vec<LayerSave>) {
         self.engine
             .batch_save_kv_blocks_from_ipc(INSTANCE_ID, 0, 0, DEVICE_ID, saves)
             .await
@@ -349,8 +351,9 @@ fn save_flush_multilayer_benchmarks(c: &mut Criterion) {
                     let mut measured = Duration::ZERO;
                     for iter in 0..iters {
                         let hashes = make_block_hashes(num_blocks, iter + 1);
+                        let saves = fixture.make_saves(&hashes);
                         let start = Instant::now();
-                        fixture.save_and_flush(&hashes).await;
+                        fixture.save_and_flush(saves).await;
                         measured += start.elapsed();
                         fixture.cleanup_cache();
                     }

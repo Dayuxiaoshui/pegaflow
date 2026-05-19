@@ -137,53 +137,40 @@ fn process_insert_batch(
     let mut inflight_bytes_removed: u64 = 0;
 
     for (key, slots) in entries {
-        let inflight_block = match inflight.entry(key.clone()) {
-            Entry::Vacant(v) => v.insert(InflightBlock::new(total_slots)),
-            Entry::Occupied(o) => {
-                let ib = o.into_mut();
-                if ib.total_slots() != total_slots {
-                    error!(
-                        "insert worker: slot count mismatch: key namespace={} expected={} got={}",
+        if !inflight.contains_key(&key) {
+            match SealedBlock::from_ordered_slot_inserts(slots, total_slots, numa_node) {
+                Ok(sealed) => {
+                    sealed_blocks.push((key, Arc::new(sealed)));
+                    continue;
+                }
+                Err(slots) => {
+                    insert_partial_slots(
+                        inflight,
+                        key,
+                        slots,
+                        total_slots,
+                        numa_node,
                         namespace,
-                        ib.total_slots(),
-                        total_slots
+                        &mut sealed_blocks,
+                        &mut inflight_bytes_added,
+                        &mut inflight_bytes_removed,
                     );
                     continue;
                 }
-                ib
-            }
-        };
-
-        let mut completed = false;
-        for (slot_id, block) in slots {
-            match inflight_block.insert_slot(slot_id, block, numa_node) {
-                SlotInsertResult::Inserted {
-                    completed: c,
-                    footprint_added,
-                } => {
-                    inflight_bytes_added = inflight_bytes_added.saturating_add(footprint_added);
-                    completed = c;
-                    if completed {
-                        break;
-                    }
-                }
-                SlotInsertResult::Duplicate => {}
             }
         }
 
-        if completed {
-            let inflight_block = inflight.remove(&key).expect("just inserted");
-            let total_footprint = inflight_block.footprint();
-            inflight_bytes_removed = inflight_bytes_removed.saturating_add(total_footprint);
-            let sealed = Arc::new(inflight_block.seal());
-
-            if let Some(deps) = deps.upgrade() {
-                deps.read_cache
-                    .batch_insert(vec![(key.clone(), Arc::clone(&sealed))]);
-            }
-
-            sealed_blocks.push((key, sealed));
-        }
+        insert_partial_slots(
+            inflight,
+            key,
+            slots,
+            total_slots,
+            numa_node,
+            namespace,
+            &mut sealed_blocks,
+            &mut inflight_bytes_added,
+            &mut inflight_bytes_removed,
+        );
     }
 
     if inflight_bytes_added > 0 {
@@ -200,7 +187,67 @@ fn process_insert_batch(
     if !sealed_blocks.is_empty()
         && let Some(deps) = deps.upgrade()
     {
+        deps.read_cache.batch_insert_refs(&sealed_blocks);
         send_backing_batches(&deps, namespace, &sealed_blocks);
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "insert worker threads batch-local accounting through the fallback path"
+)]
+fn insert_partial_slots(
+    inflight: &mut HashMap<BlockKey, InflightBlock>,
+    key: BlockKey,
+    slots: Vec<(usize, Arc<crate::block::RawBlock>)>,
+    total_slots: usize,
+    numa_node: NumaNode,
+    namespace: &str,
+    sealed_blocks: &mut Vec<(BlockKey, Arc<SealedBlock>)>,
+    inflight_bytes_added: &mut u64,
+    inflight_bytes_removed: &mut u64,
+) {
+    let inflight_block = match inflight.entry(key.clone()) {
+        Entry::Vacant(v) => v.insert(InflightBlock::new(total_slots)),
+        Entry::Occupied(o) => {
+            let ib = o.into_mut();
+            if ib.total_slots() != total_slots {
+                error!(
+                    "insert worker: slot count mismatch: key namespace={} expected={} got={}",
+                    namespace,
+                    ib.total_slots(),
+                    total_slots
+                );
+                return;
+            }
+            ib
+        }
+    };
+
+    let mut completed = false;
+    for (slot_id, block) in slots {
+        match inflight_block.insert_slot(slot_id, block, numa_node) {
+            SlotInsertResult::Inserted {
+                completed: c,
+                footprint_added,
+            } => {
+                *inflight_bytes_added = inflight_bytes_added.saturating_add(footprint_added);
+                completed = c;
+                if completed {
+                    break;
+                }
+            }
+            SlotInsertResult::Duplicate => {}
+        }
+    }
+
+    if completed {
+        let inflight_block = inflight.remove(&key).expect("just inserted");
+        let total_footprint = inflight_block.footprint();
+        *inflight_bytes_removed = inflight_bytes_removed.saturating_add(total_footprint);
+        let sealed = Arc::new(inflight_block.seal());
+
+        sealed_blocks.push((key, sealed));
     }
 }
 
