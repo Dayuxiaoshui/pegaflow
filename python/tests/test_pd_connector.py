@@ -306,7 +306,13 @@ def test_scheduler_registers_remote_wait_once_until_done() -> None:
     )
     scheduler.update_state_after_alloc(request, ([1],), num_external_tokens=3)
     third = scheduler.build_connector_meta(SimpleNamespace())
-    assert set(third.reqs_to_wait) == {"req-1"}
+    assert third.reqs_to_wait == {}
+
+    scheduler.request_finished(request, ([1],))
+    scheduler.build_connector_meta(SimpleNamespace())
+    scheduler.update_state_after_alloc(request, ([1],), num_external_tokens=3)
+    after_release = scheduler.build_connector_meta(SimpleNamespace())
+    assert set(after_release.reqs_to_wait) == {"req-1"}
 
 
 def test_d_worker_submits_prefill_request_after_alloc() -> None:
