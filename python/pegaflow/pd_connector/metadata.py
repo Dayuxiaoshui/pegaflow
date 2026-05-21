@@ -72,6 +72,7 @@ class LayerRemoteLayout:
     layer_idx: int
     base_addr: int
     block_bytes: int
+    block_ids: tuple[int, ...]
     k_block_addrs: tuple[int, ...]
     v_block_addrs: tuple[int, ...]
     mr_desc: Any | None = None

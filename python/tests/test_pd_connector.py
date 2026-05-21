@@ -5,6 +5,8 @@ import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from .unit_stubs import install_connector_unit_stubs
 
 install_connector_unit_stubs()
@@ -24,7 +26,9 @@ from pegaflow.pd_connector.layout import (  # noqa: E402
     unique_blocks_from_slot_mapping,
 )
 from pegaflow.pd_connector.metadata import (  # noqa: E402
+    LayerRemoteLayout,
     PdConnectorMetadata,
+    PdHandshake,
     PushReqMeta,
     RemoteEndpoint,
     WaitReqMeta,
@@ -34,6 +38,7 @@ from pegaflow.pd_connector.proxy import (  # noqa: E402
     ProxyConfig,
     build_pd_proxy_request,
 )
+from pegaflow.pd_connector.rdma import RealRdmaPort  # noqa: E402
 from pegaflow.pd_connector.scheduler import PdSchedulerConnector  # noqa: E402
 from pegaflow.pd_connector.worker import PdWorkerConnector  # noqa: E402
 
@@ -84,6 +89,71 @@ class FakePrefillSender:
         self.tasks.append(task)
 
 
+class FakeNativeRdmaEngine:
+    def __init__(self) -> None:
+        self.local_layers = []
+        self.remote_regs = []
+        self.pushed_layers = []
+        self.done_reqs = []
+        self.waited_reqs = []
+        self.marked_reqs = []
+        self.finished_sending = ["sent-1"]
+        self.finished_recving = ["recv-1"]
+
+    def register_local_layers(self, layers):
+        self.local_layers.append(layers)
+        registered = []
+        for layer in layers:
+            registered.append(
+                {
+                    **layer,
+                    "mr_desc": {
+                        "ptr": layer["base_addr"],
+                        "addr_rkey_list": [["10.0.0.1:1", 17]],
+                    },
+                }
+            )
+        return registered
+
+    def register_remote(self, req_id, handshake):
+        assert handshake is not None
+        assert handshake["request_id"]
+        for layer in handshake["layers"]:
+            assert layer["mr_desc"]["addr_rkey_list"]
+            assert (
+                len(layer["block_ids"])
+                == len(layer["k_block_addrs"])
+                == len(layer["v_block_addrs"])
+            )
+        self.remote_regs.append((req_id, handshake))
+
+    def push_layer(self, req_id, layer_idx, blocks):
+        for block in blocks:
+            assert set(block) == {"k", "v"}
+            assert block["k"]["block_id"] == block["v"]["block_id"]
+            assert block["k"]["bytes"] == block["v"]["bytes"]
+        self.pushed_layers.append((req_id, layer_idx, blocks))
+
+    def push_done(self, req_id):
+        self.done_reqs.append(req_id)
+
+    def wait_done(self, req_id):
+        self.waited_reqs.append(req_id)
+
+    def mark_done(self, req_id):
+        self.marked_reqs.append(req_id)
+
+    def pop_finished_sending(self):
+        finished = self.finished_sending
+        self.finished_sending = []
+        return finished
+
+    def pop_finished_recving(self):
+        finished = self.finished_recving
+        self.finished_recving = []
+        return finished
+
+
 def test_flash_attn_hnd_layout_offsets() -> None:
     # Logical shape [2, num_blocks, block_size, num_kv_heads, head_size].
     # HND physical order [2, num_blocks, num_kv_heads, block_size, head_size].
@@ -97,6 +167,101 @@ def test_flash_attn_hnd_layout_offsets() -> None:
     assert layout.block_bytes == 16 * 4 * 32 * 2
     assert layout.block_offset_bytes(0, 3) == 3 * 4 * 16 * 32 * 2
     assert layout.block_offset_bytes(1, 3) == (8 * 4 * 16 * 32 + 3 * 4 * 16 * 32) * 2
+
+
+def test_real_rdma_port_preserves_native_contract_for_pd_push() -> None:
+    native_engine = FakeNativeRdmaEngine()
+    rdma = RealRdmaPort(native_engine)
+    layer = LayerRemoteLayout(
+        layer_name="layer.0",
+        layer_idx=0,
+        base_addr=0x1000,
+        block_bytes=1024,
+        block_ids=(0, 1),
+        k_block_addrs=(0x1000, 0x1400),
+        v_block_addrs=(0x1800, 0x1C00),
+    )
+
+    registered = rdma.register_local_layers((layer,))
+
+    assert registered[0].mr_desc == {
+        "ptr": 0x1000,
+        "addr_rkey_list": [["10.0.0.1:1", 17]],
+    }
+    assert registered[0].block_ids == (0, 1)
+    assert registered[0].k_block_addrs == (0x1000, 0x1400)
+    assert registered[0].v_block_addrs == (0x1800, 0x1C00)
+
+    handshake = PdHandshake(
+        request_id="req-1",
+        engine_id="decode",
+        tp_rank=0,
+        tp_size=1,
+        block_size=16,
+        kv_layout="flash_attn_hnd",
+        layers=registered,
+    )
+    rdma.register_remote("req-1", handshake)
+
+    assert native_engine.remote_regs[0][0] == "req-1"
+    assert native_engine.remote_regs[0][1]["layers"][0]["mr_desc"]["ptr"] == 0x1000
+    assert native_engine.remote_regs[0][1]["layers"][0]["block_ids"] == [0, 1]
+
+    rdma.push_layer(
+        "req-1",
+        0,
+        [
+            FlashAttnHndLayout(
+                "layer.0", (2, 8, 16, 4, 32), (16384, 2048, 32, 512, 1), 2, 0x1000
+            ).block_slices(1)
+        ],
+    )
+    rdma.push_done("req-1")
+    rdma.wait_done("req-1")
+    rdma.mark_done("req-1")
+
+    _, _, pushed_blocks = native_engine.pushed_layers[0]
+    assert pushed_blocks == [
+        {
+            "k": {"block_id": 1, "src_offset_bytes": 2048 * 2, "bytes": 4096},
+            "v": {
+                "block_id": 1,
+                "src_offset_bytes": (16384 + 2048) * 2,
+                "bytes": 4096,
+            },
+        }
+    ]
+    assert native_engine.done_reqs == ["req-1"]
+    assert native_engine.waited_reqs == ["req-1"]
+    assert native_engine.marked_reqs == ["req-1"]
+    assert rdma.pop_finished_sending() == {"sent-1"}
+    assert rdma.pop_finished_sending() == set()
+    assert rdma.pop_finished_recving() == {"recv-1"}
+    assert rdma.pop_finished_recving() == set()
+
+
+def test_real_rdma_port_rejects_native_layout_without_block_mapping() -> None:
+    native_engine = FakeNativeRdmaEngine()
+
+    def broken_register_local_layers(layers):
+        registered = [{**layers[0], "mr_desc": {"ptr": 0x1000, "addr_rkey_list": []}}]
+        registered[0].pop("block_ids")
+        return registered
+
+    native_engine.register_local_layers = broken_register_local_layers
+    rdma = RealRdmaPort(native_engine)
+    layer = LayerRemoteLayout(
+        layer_name="layer.0",
+        layer_idx=0,
+        base_addr=0x1000,
+        block_bytes=1024,
+        block_ids=(0,),
+        k_block_addrs=(0x1000,),
+        v_block_addrs=(0x1400,),
+    )
+
+    with pytest.raises(KeyError, match="block_ids"):
+        rdma.register_local_layers((layer,))
 
 
 def test_pd_worker_pushes_flash_attn_hnd_blocks() -> None:

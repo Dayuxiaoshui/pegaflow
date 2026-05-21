@@ -127,6 +127,7 @@ class FlashAttnHndLayout:
             layer_idx=layer_idx,
             base_addr=self.base_addr,
             block_bytes=self.block_bytes,
+            block_ids=ordered,
             k_block_addrs=tuple(
                 self.base_addr + self.block_offset_bytes(0, block_id) for block_id in ordered
             ),
