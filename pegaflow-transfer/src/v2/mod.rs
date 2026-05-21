@@ -34,7 +34,7 @@ mod utils;
 mod verbs;
 mod worker;
 
-pub use crate::cuda_lib::{CudaDeviceId, Device};
+pub use crate::cuda_lib::{CudaDeviceId, CudaDeviceMemory, Device};
 pub use api::{
     BarrierTransferRequest, DomainAddress, DomainGroupRouting, GroupTransferRouting, ImmCounter,
     ImmTransferRequest, MemoryRegionDescriptor, MemoryRegionHandle, MemoryRegionRemoteKey,

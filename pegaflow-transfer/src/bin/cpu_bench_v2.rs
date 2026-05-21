@@ -16,14 +16,14 @@ use std::{
     time::Instant,
 };
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use pegaflow_common::read_cpu_topology_from_sysfs;
 use pegaflow_transfer::{
     init_logging,
     v2::{
-        Device, DomainGroupRouting, ImmTransferRequest, MemoryRegionDescriptor, MemoryRegionHandle,
-        RdmaEngine, SingleTransferRequest, TopologyGroup, TransferEngine, TransferEngineBuilder,
-        TransferRequest, detect_topology,
+        CudaDeviceId, CudaDeviceMemory, Device, DomainGroupRouting, ImmTransferRequest,
+        MemoryRegionDescriptor, MemoryRegionHandle, RdmaEngine, SingleTransferRequest,
+        TopologyGroup, TransferEngine, TransferEngineBuilder, TransferRequest, detect_topology,
     },
 };
 
@@ -34,6 +34,10 @@ use pegaflow_transfer::{
     about = "v2 RDMA CPU-memory PD push benchmark"
 )]
 struct Cli {
+    /// Memory kind to register and transfer.
+    #[arg(long, value_enum, default_value_t = MemoryKind::Host)]
+    memory: MemoryKind,
+
     /// Block size, for example "4mb" or "2mb".
     #[arg(long, default_value = "4mb")]
     block_size: String,
@@ -77,6 +81,12 @@ struct Cli {
     /// Only run the aggregate routing pass.
     #[arg(long)]
     aggregate_only: bool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum MemoryKind {
+    Host,
+    Cuda,
 }
 
 struct SimpleRng {
@@ -201,19 +211,64 @@ impl Drop for NumaBuffer {
     }
 }
 
+enum BenchBuffer {
+    Host(NumaBuffer),
+    Cuda(CudaDeviceMemory),
+}
+
+impl BenchBuffer {
+    fn alloc(
+        memory: MemoryKind,
+        cuda_device: u8,
+        numa_node: u32,
+        len: usize,
+        use_hugepages: bool,
+    ) -> Self {
+        match memory {
+            MemoryKind::Host => Self::Host(NumaBuffer::alloc(numa_node, len, use_hugepages)),
+            MemoryKind::Cuda => Self::Cuda(
+                CudaDeviceMemory::device_on(len, cuda_device).expect("cudaMalloc failed"),
+            ),
+        }
+    }
+
+    fn ptr(&self) -> NonNull<u8> {
+        match self {
+            BenchBuffer::Host(buf) => buf.ptr,
+            BenchBuffer::Cuda(buf) => buf.ptr().cast(),
+        }
+    }
+
+    fn device(&self, cuda_device: u8) -> Device {
+        match self {
+            BenchBuffer::Host(_) => Device::Host,
+            BenchBuffer::Cuda(_) => Device::Cuda(CudaDeviceId(cuda_device)),
+        }
+    }
+
+    fn fill(&self, pattern: u8) {
+        match self {
+            BenchBuffer::Host(buf) => buf.fill(pattern),
+            BenchBuffer::Cuda(buf) => buf.fill(pattern).expect("cudaMemset failed"),
+        }
+    }
+}
+
 struct EngineContext {
     prefill: TransferEngine,
     decode: TransferEngine,
-    prefill_buf: NumaBuffer,
-    decode_buf: NumaBuffer,
+    prefill_buf: BenchBuffer,
+    decode_buf: BenchBuffer,
     prefill_mr: MemoryRegionHandle,
     decode_mr: MemoryRegionDescriptor,
 }
 
 impl Drop for EngineContext {
     fn drop(&mut self) {
-        let _ = self.prefill.unregister_memory(self.prefill_buf.ptr.cast());
-        let _ = self.decode.unregister_memory(self.decode_buf.ptr.cast());
+        let _ = self
+            .prefill
+            .unregister_memory(self.prefill_buf.ptr().cast());
+        let _ = self.decode.unregister_memory(self.decode_buf.ptr().cast());
         self.prefill.stop();
         self.decode.stop();
     }
@@ -282,7 +337,8 @@ fn main() {
     let pool_blocks = pool_size / block_size;
 
     println!(
-        "pegaflow-cpu-bench-v2: block_size={} blocks_per_task={} tasks={} warmup={} pool_size={} hugepages={}",
+        "pegaflow-cpu-bench-v2: memory={:?} block_size={} blocks_per_task={} tasks={} warmup={} pool_size={} hugepages={}",
+        cli.memory,
         cli.block_size,
         cli.blocks_per_task,
         cli.tasks,
@@ -348,7 +404,7 @@ fn main() {
                 .join(", "),
         );
 
-        let ctx = create_engine_context(group, domains, pool_size, cli.use_hugepages);
+        let ctx = create_engine_context(group, domains, cli.memory, pool_size, cli.use_hugepages);
         println!(
             "  engines ready: domains={} groups={} aggregate_link_speed={} Mbps",
             ctx.prefill.num_domains(),
@@ -394,6 +450,7 @@ fn main() {
 fn create_engine_context(
     group: &TopologyGroup,
     domains: Vec<pegaflow_transfer::v2::DomainInfo>,
+    memory: MemoryKind,
     buf_size: usize,
     use_hugepages: bool,
 ) -> EngineContext {
@@ -406,8 +463,20 @@ fn create_engine_context(
     let decode_worker_cpu = group.cpus.get(2).copied().unwrap_or(prefill_worker_cpu);
     let decode_uvm_cpu = group.cpus.get(3).copied().unwrap_or(decode_worker_cpu);
 
-    let prefill_buf = NumaBuffer::alloc(group.numa as u32, buf_size, use_hugepages);
-    let decode_buf = NumaBuffer::alloc(group.numa as u32, buf_size, use_hugepages);
+    let prefill_buf = BenchBuffer::alloc(
+        memory,
+        group.cuda_device,
+        group.numa as u32,
+        buf_size,
+        use_hugepages,
+    );
+    let decode_buf = BenchBuffer::alloc(
+        memory,
+        group.cuda_device,
+        group.numa as u32,
+        buf_size,
+        use_hugepages,
+    );
     prefill_buf.fill(0xBB);
     decode_buf.fill(0xAA);
 
@@ -425,10 +494,18 @@ fn create_engine_context(
     );
 
     let prefill_mr = prefill
-        .register_memory_local(prefill_buf.ptr.cast(), buf_size, Device::Host)
+        .register_memory_local(
+            prefill_buf.ptr().cast(),
+            buf_size,
+            prefill_buf.device(group.cuda_device),
+        )
         .expect("prefill register_memory_local failed");
     let (_decode_local_mr, decode_mr) = decode
-        .register_memory_allow_remote(decode_buf.ptr.cast(), buf_size, Device::Host)
+        .register_memory_allow_remote(
+            decode_buf.ptr().cast(),
+            buf_size,
+            decode_buf.device(group.cuda_device),
+        )
         .expect("decode register_memory_allow_remote failed");
 
     EngineContext {

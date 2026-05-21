@@ -6,7 +6,7 @@ use crate::cudart_sys::{cudaHostAllocMapped, cudaHostAllocPortable, cudaMemAttac
 use libc::memset;
 
 use crate::cuda_lib::rt::CudartError;
-use crate::cuda_lib::rt::{cudaFreeHost, cudaHostAlloc};
+use crate::cuda_lib::rt::{cudaFreeHost, cudaHostAlloc, cudaSetDevice};
 
 /// Owned Cuda memory. It will be freed when dropped.
 pub struct CudaDeviceMemory {
@@ -21,6 +21,11 @@ impl CudaDeviceMemory {
         let ret = unsafe { cudart_sys::cudaMalloc(&raw mut ptr, size) };
         let ptr = NonNull::new(ptr).ok_or_else(|| CudartError::new(ret as u32, "cudaMalloc"))?;
         Ok(Self { ptr, size })
+    }
+
+    pub fn device_on(size: usize, device: u8) -> Result<Self, CudartError> {
+        cudaSetDevice(device as i32)?;
+        Self::device(size)
     }
 
     /// Allocate a CUDA buffer visible to both host and device.
@@ -64,6 +69,15 @@ impl CudaDeviceMemory {
     pub fn zero(&self) {
         unsafe {
             cudart_sys::cudaMemset(self.ptr.as_ptr(), 0, self.size);
+        }
+    }
+
+    pub fn fill(&self, value: u8) -> Result<(), CudartError> {
+        let ret = unsafe { cudart_sys::cudaMemset(self.ptr.as_ptr(), value as i32, self.size) };
+        if ret == cudart_sys::cudaError::cudaSuccess {
+            Ok(())
+        } else {
+            Err(CudartError::new(ret as u32, "cudaMemset"))
         }
     }
 
