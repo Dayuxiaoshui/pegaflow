@@ -1,9 +1,10 @@
 """Small P/D proxy for exercising PdConnector with two local vLLM servers.
 
 The proxy accepts OpenAI-compatible completion requests, injects the
-``kv_transfer_params`` expected by ``PdConnector``, starts the decode request
-against D, then starts the prefill request against P. D only begins decoding
-after its connector observes the async fake-RDMA done notification from P.
+``kv_transfer_params`` expected by ``PdConnector``, and sends the request only
+to D. D allocates KV blocks, then uses the P hint from those params to trigger
+the prefill side. D begins decoding after its connector observes the async
+fake-RDMA done notification from P.
 """
 
 from __future__ import annotations
@@ -12,9 +13,7 @@ import argparse
 import copy
 import json
 import logging
-import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -40,7 +39,6 @@ class ProxyConfig:
 @dataclass(frozen=True)
 class PdProxyRequest:
     request_id: str
-    prefill_body: dict[str, Any]
     decode_body: dict[str, Any]
 
 
@@ -53,23 +51,14 @@ def build_pd_proxy_request(
     prefill_req_id = f"{req_id}-p"
     decode_req_id = f"{req_id}-d"
 
-    prefill_body = copy.deepcopy(body)
     decode_body = copy.deepcopy(body)
-
-    prefill_body["request_id"] = prefill_req_id
-    prefill_body["stream"] = False
-    prefill_body["max_tokens"] = int(body.get("pd_prefill_max_tokens", config.prefill_max_tokens))
-    prefill_body["kv_transfer_params"] = {
-        "do_remote_prefill_sender": True,
-        "target_engine_id": "decode",
-        "target_request_id": decode_req_id,
-        "done_endpoint": config.done_endpoint,
-    }
 
     decode_body["request_id"] = decode_req_id
     decode_body["stream"] = False
     decode_body["kv_transfer_params"] = {
         "do_remote_prefill": True,
+        "prefill_url": config.prefill_url,
+        "prefill_max_tokens": int(body.get("pd_prefill_max_tokens", config.prefill_max_tokens)),
         "remote_engine_id": "prefill",
         "remote_request_id": prefill_req_id,
         "done_request_id": decode_req_id,
@@ -78,7 +67,6 @@ def build_pd_proxy_request(
 
     return PdProxyRequest(
         request_id=req_id,
-        prefill_body=prefill_body,
         decode_body=decode_body,
     )
 
@@ -86,7 +74,6 @@ def build_pd_proxy_request(
 class PdProxy:
     def __init__(self, config: ProxyConfig) -> None:
         self.config = config
-        self.executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="pd-proxy")
 
     def handle_openai_request(self, path: str, body: dict[str, Any]) -> tuple[int, bytes, str]:
         if path not in SUPPORTED_PATHS:
@@ -104,37 +91,12 @@ class PdProxy:
             self.config.done_endpoint,
         )
 
-        decode_future = self.executor.submit(
-            _post_json,
+        decode_status, decode_body, decode_content_type = _post_json(
             self.config.decode_url + path,
             req.decode_body,
             self.config.timeout_s,
             req.request_id,
             "D",
-        )
-
-        # Give D a small head start so its connector can allocate blocks and
-        # bind the fake-RDMA done endpoint before P finishes the prefill pass.
-        time.sleep(0.05)
-        prefill_future = self.executor.submit(
-            _post_json,
-            self.config.prefill_url + path,
-            req.prefill_body,
-            self.config.timeout_s,
-            req.request_id,
-            "P",
-        )
-
-        prefill_status, prefill_body, _ = prefill_future.result(timeout=self.config.timeout_s)
-        logger.info(
-            "[PdProxy] request=%s P completed status=%s bytes=%d",
-            req.request_id,
-            prefill_status,
-            len(prefill_body),
-        )
-
-        decode_status, decode_body, decode_content_type = decode_future.result(
-            timeout=self.config.timeout_s
         )
         logger.info(
             "[PdProxy] request=%s D completed status=%s bytes=%d",
@@ -145,7 +107,7 @@ class PdProxy:
         return decode_status, decode_body, decode_content_type
 
     def close(self) -> None:
-        self.executor.shutdown(wait=True, cancel_futures=True)
+        return None
 
 
 def _post_json(

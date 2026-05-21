@@ -686,14 +686,13 @@ curl -s http://127.0.0.1:8100/v1/completions \
 
 这条路径的语义：
 1. proxy 收到请求后生成同一个逻辑 request id；
-2. proxy 先向 D 发 decode 请求，注入 `do_remote_prefill=true` 和 `done_endpoint`；
-3. D 的 connector allocate KV blocks 后异步等待 fake-RDMA done，不在 hook 里阻塞；
-4. proxy 再向 P 发 prefill 请求，注入 `do_remote_prefill_sender=true`、D 的 request id 和同一个 `done_endpoint`；
-5. P 的 connector 在最后一层覆盖完目标 blocks 后，后台 ZMQ sender fire-and-forget 发 done；
-6. D 的后台 ZMQ receiver 收到 done 后在 `get_finished` 里上报 `finished_recving`，vLLM 才继续 decode。
+2. proxy 只向 D 发 decode 请求，注入 `do_remote_prefill=true`、`prefill_url` 和 `done_endpoint`；
+3. D 的 connector allocate KV blocks 后进入 async load，并用 proxy 给的 P hint 触发 P prefill；
+4. P 的 connector 在最后一层覆盖完目标 blocks 后，后台 ZMQ sender fire-and-forget 发 done；
+5. D 的后台 ZMQ receiver 收到 done 后在 `get_finished` 里上报 `finished_recving`，vLLM 才继续 decode。
 
 验收先看三份日志：
-- `proxy.log`：应出现 `request=... -> D`、`request=... -> P`、`P completed`、`D completed`；
+- `proxy.log`：应出现 `request=... -> D`、`D completed`，不应出现 `request=... -> P`；
 - `p.log`：应出现 `P queued async push`、`P finished fake RDMA push`、`P sent fake RDMA done`；
 - `d.log`：应出现 `D queued async wait`、`fake RDMA done receiver listening`、`D received fake RDMA done`。
 

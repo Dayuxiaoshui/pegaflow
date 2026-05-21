@@ -268,7 +268,7 @@ def test_scheduler_carries_fake_rdma_done_endpoint() -> None:
     assert meta.reqs_to_wait["req-1"].done_request_id == "req-1"
 
 
-def test_pd_proxy_injects_p_and_d_transfer_params() -> None:
+def test_pd_proxy_only_sends_decode_request_with_prefill_hint() -> None:
     config = ProxyConfig(
         prefill_url="http://127.0.0.1:8001",
         decode_url="http://127.0.0.1:8002",
@@ -287,18 +287,12 @@ def test_pd_proxy_injects_p_and_d_transfer_params() -> None:
         request_id="pd-test",
     )
 
-    assert req.prefill_body["request_id"] == "pd-test-p"
-    assert req.prefill_body["max_tokens"] == 1
-    assert req.prefill_body["kv_transfer_params"] == {
-        "do_remote_prefill_sender": True,
-        "target_engine_id": "decode",
-        "target_request_id": "pd-test-d",
-        "done_endpoint": "tcp://127.0.0.1:7200",
-    }
     assert req.decode_body["request_id"] == "pd-test-d"
     assert req.decode_body["max_tokens"] == 4
     assert req.decode_body["kv_transfer_params"] == {
         "do_remote_prefill": True,
+        "prefill_url": "http://127.0.0.1:8001",
+        "prefill_max_tokens": 1,
         "remote_engine_id": "prefill",
         "remote_request_id": "pd-test-p",
         "done_request_id": "pd-test-d",
