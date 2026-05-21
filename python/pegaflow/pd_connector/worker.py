@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import queue
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -18,6 +18,7 @@ from pegaflow.pd_connector.layout import (
     unique_blocks_from_slot_mapping,
 )
 from pegaflow.pd_connector.metadata import (
+    LayerRemoteLayout,
     PdConnectorMetadata,
     PdHandshake,
     PdPrefillRequest,
@@ -27,7 +28,7 @@ from pegaflow.pd_connector.metadata import (
     handshake_to_dict,
 )
 from pegaflow.pd_connector.oob import InMemoryOobPort
-from pegaflow.pd_connector.rdma import NoopRdmaPort, RdmaPort, build_rdma_port
+from pegaflow.pd_connector.rdma import RdmaPort, build_rdma_port
 
 logger = get_connector_logger()
 
@@ -41,7 +42,7 @@ class PdWorkerConnector:
         prefill_sender: Any | None = None,
     ) -> None:
         self.vllm_config = vllm_config
-        self.rdma = rdma or NoopRdmaPort()
+        self.rdma = rdma
         self._rdma_is_injected = rdma is not None
         self.oob = oob or InMemoryOobPort()
         self.engine_id = (
@@ -52,6 +53,7 @@ class PdWorkerConnector:
         self.tp_size = int(getattr(parallel_config, "tensor_parallel_size", 1) or 1)
         self.layouts: dict[str, FlashAttnHndLayout] = {}
         self.layer_names: list[str] = []
+        self._registered_layers: dict[str, LayerRemoteLayout] = {}
         self._wait_reqs: dict[str, WaitReqMeta] = {}
         self._push_reqs: dict[str, PushReqMeta] = {}
         self._done_aliases: dict[str, str] = {}
@@ -59,6 +61,7 @@ class PdWorkerConnector:
         self._failed_blocks: set[int] = set()
         self._done_sender = _AsyncDoneSender()
         self._done_receiver: _AsyncDoneReceiver | None = None
+        self._rdma_waiter = _AsyncRdmaDoneWaiter(self.rdma) if self.rdma is not None else None
         self._prefill_sender = prefill_sender or _AsyncPrefillSender()
 
     def register_kv_caches(self, kv_caches: dict[str, Any]) -> None:
@@ -69,12 +72,15 @@ class PdWorkerConnector:
         self.layer_names = list(kv_caches.keys())
         if not self._rdma_is_injected:
             self.rdma = build_rdma_port(self.vllm_config, _infer_cuda_device(kv_caches))
-        self.rdma.register_local_layers(
+            self._rdma_waiter = _AsyncRdmaDoneWaiter(self.rdma)
+        assert self.rdma is not None
+        registered_layers = self.rdma.register_local_layers(
             tuple(
                 self.layouts[layer_name].remote_layout(layer_idx)
                 for layer_idx, layer_name in enumerate(self.layer_names)
             )
         )
+        self._registered_layers = {layer.layer_name: layer for layer in registered_layers}
         logger.info(
             "[PdConnector] registered %d FlashAttention HND KV cache layers",
             len(self.layouts),
@@ -86,9 +92,20 @@ class PdWorkerConnector:
         forward_context: Any,
         **kwargs: Any,
     ) -> None:
+        logger.debug(
+            "[PdConnector] worker start_load_kv metadata=%s wait_reqs=%s push_reqs=%s release=%s known_wait=%s known_push=%s",
+            metadata,
+            sorted(metadata.reqs_to_wait),
+            sorted(metadata.reqs_to_push),
+            sorted(metadata.reqs_to_release),
+            sorted(self._wait_reqs),
+            sorted(self._push_reqs),
+        )
+        assert self.rdma is not None, "PdConnector RDMA port is not initialized"
+        assert self._rdma_waiter is not None, "PdConnector RDMA waiter is not initialized"
         for req_id, req in metadata.reqs_to_wait.items():
             if req_id in self._wait_reqs:
-                logger.debug("[PdConnector] D wait req=%s already registered", req_id)
+                logger.info("[PdConnector] D wait req=%s already registered", req_id)
                 continue
             self._wait_reqs[req_id] = req
             self._done_aliases[req.done_request_id] = req_id
@@ -109,6 +126,8 @@ class PdWorkerConnector:
                 )
             )
             self.rdma.register_remote(req_id, handshake)
+            if not req.remote.done_endpoint:
+                self._rdma_waiter.submit(req_id)
             if req.prefill_url:
                 self._prefill_sender.submit(
                     _PrefillHttpTask(
@@ -149,6 +168,7 @@ class PdWorkerConnector:
             )
 
         for req_id in metadata.reqs_to_release:
+            logger.debug("[PdConnector] worker release req=%s", req_id)
             self._wait_reqs.pop(req_id, None)
             self._push_reqs.pop(req_id, None)
             self._done_aliases = {
@@ -173,6 +193,10 @@ class PdWorkerConnector:
         assert layout is not None, (
             f"PdConnector saw unknown layer {layer_name}; registered={list(self.layouts)}"
         )
+        layer_idx = self._layer_idx(layer_name)
+        should_log_push = bool(self._push_reqs) and (
+            layer_idx == 0 or layer_idx == len(self.layer_names) - 1
+        )
         # Re-assert the runtime tensor. CUDA graph or backend changes must not
         # silently swap in a different layout.
         runtime_layout = FlashAttnHndLayout.from_tensor(layer_name, kv_layer)
@@ -183,16 +207,38 @@ class PdWorkerConnector:
 
         slot_mapping = getattr(attn_metadata, "slot_mapping", None)
         if slot_mapping is None:
+            if should_log_push:
+                logger.debug(
+                    "[PdConnector] P save skipped reqs=%d layer=%s reason=no_slot_mapping metadata=%s",
+                    len(self._push_reqs),
+                    layer_name,
+                    type(attn_metadata).__name__,
+                )
             return
         touched_blocks = unique_blocks_from_slot_mapping(slot_mapping, layout.block_size)
         if not touched_blocks:
+            if should_log_push:
+                logger.debug(
+                    "[PdConnector] P save skipped reqs=%d layer=%s reason=no_touched_blocks",
+                    len(self._push_reqs),
+                    layer_name,
+                )
             return
 
-        layer_idx = self._layer_idx(layer_name)
         is_last_layer = layer_idx == len(self.layer_names) - 1
         for req_id, req in list(self._push_reqs.items()):
             req_blocks = flatten_block_ids(req.local_block_ids)
             selected = sorted(touched_blocks & req_blocks)
+            if should_log_push:
+                logger.debug(
+                    "[PdConnector] P save layer req=%s layer=%s idx=%d touched=%s req_blocks=%s selected=%s",
+                    req_id,
+                    layer_name,
+                    layer_idx,
+                    sorted(touched_blocks),
+                    sorted(req_blocks),
+                    selected,
+                )
             if not selected:
                 continue
             block_slices: list[LayerBlockSlices] = [
@@ -218,7 +264,7 @@ class PdWorkerConnector:
                     )
                 self._tracker.mark_done(req_id)
                 logger.info(
-                    "[PdConnector] P finished fake RDMA push req=%s target_req=%s layers=%d blocks=%d",
+                    "[PdConnector] P finished RDMA push req=%s target_req=%s layers=%d blocks=%d",
                     req_id,
                     req.target_request_id,
                     len(self.layer_names),
@@ -226,10 +272,25 @@ class PdWorkerConnector:
                 )
 
     def wait_for_save(self) -> None:
+        logger.debug(
+            "[PdConnector] worker wait_for_save push_reqs=%s tracker=%s",
+            sorted(self._push_reqs),
+            sorted(self._tracker._requests),
+        )
         return None
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str] | None, set[str] | None]:
+        logger.debug(
+            "[PdConnector] worker get_finished enter finished_req_ids=%s wait_reqs=%s push_reqs=%s done_receiver=%s",
+            sorted(finished_req_ids),
+            sorted(self._wait_reqs),
+            sorted(self._push_reqs),
+            self._done_receiver is not None,
+        )
         self._drain_done_receiver()
+        if self._done_receiver is None:
+            for req_id in list(self._wait_reqs):
+                self.rdma.poll_done(req_id)
         finished_sending = self.rdma.pop_finished_sending()
         finished_recving = self.rdma.pop_finished_recving()
         for req_id in finished_sending:
@@ -240,6 +301,13 @@ class PdWorkerConnector:
             self._done_aliases = {
                 alias: target for alias, target in self._done_aliases.items() if target != req_id
             }
+        logger.debug(
+            "[PdConnector] worker get_finished exit sending=%s recving=%s remaining_wait=%s remaining_push=%s",
+            sorted(finished_sending),
+            sorted(finished_recving),
+            sorted(self._wait_reqs),
+            sorted(self._push_reqs),
+        )
         return finished_sending or None, finished_recving or None
 
     def get_block_ids_with_load_errors(self) -> set[int]:
@@ -255,9 +323,15 @@ class PdWorkerConnector:
             self._done_receiver.close()
             self._done_receiver = None
         self._done_sender.close()
+        if self._rdma_waiter is not None:
+            self._rdma_waiter.close()
         close = getattr(self._prefill_sender, "close", None)
         if close is not None:
             close()
+
+    def _rdma(self) -> RdmaPort:
+        assert self.rdma is not None, "PdConnector RDMA port is not initialized"
+        return self.rdma
 
     def _layer_idx(self, layer_name: str) -> int:
         try:
@@ -274,10 +348,22 @@ class PdWorkerConnector:
             block_size=next(iter(self.layouts.values())).block_size,
             kv_layout="HND",
             layers=tuple(
-                self.layouts[layer_name].remote_layout(layer_idx, block_ids)
+                self._remote_layout_with_mr_desc(layer_name, layer_idx, block_ids)
                 for layer_idx, layer_name in enumerate(self.layer_names)
             ),
         )
+
+    def _remote_layout_with_mr_desc(
+        self,
+        layer_name: str,
+        layer_idx: int,
+        block_ids: set[int],
+    ) -> LayerRemoteLayout:
+        layout = self.layouts[layer_name].remote_layout(layer_idx, block_ids)
+        registered = self._registered_layers.get(layer_name)
+        if registered is None:
+            return layout
+        return replace(layout, mr_desc=registered.mr_desc)
 
     def _ensure_done_receiver(self, endpoint: str) -> None:
         if self._done_receiver is None:
@@ -397,6 +483,35 @@ class _AsyncDoneSender:
                 self._queue.task_done()
         for socket in sockets.values():
             socket.close(linger=0)
+
+
+class _AsyncRdmaDoneWaiter:
+    def __init__(self, rdma: RdmaPort) -> None:
+        self.rdma = rdma
+        self._queue: queue.Queue[str | None] = queue.Queue()
+        self._submitted: set[str] = set()
+        self._thread = threading.Thread(target=self._run, name="pd-rdma-done-waiter", daemon=True)
+        self._thread.start()
+
+    def submit(self, req_id: str) -> None:
+        if req_id in self._submitted:
+            return
+        self._submitted.add(req_id)
+        self._queue.put(req_id)
+
+    def close(self) -> None:
+        self._queue.put(None)
+
+    def _run(self) -> None:
+        while True:
+            req_id = self._queue.get()
+            if req_id is None:
+                return
+            try:
+                self.rdma.wait_done(req_id)
+                logger.info("[PdConnector] D received RDMA done req=%s", req_id)
+            except Exception:
+                logger.exception("[PdConnector] D RDMA done wait failed req=%s", req_id)
 
 
 @dataclass(frozen=True)

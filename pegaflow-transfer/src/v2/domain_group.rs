@@ -190,9 +190,10 @@ impl<D: RdmaDomain, const N: usize> DomainGroup<D, N> {
 
         // Chunk by domain and submit the writes.
         for (i, dst_mrs) in dst_mrs.chunks(imm_per_domain).enumerate() {
-            let domain = &mut self.domains[(first_domain + i) % num_domains];
+            let domain_idx = (first_domain + i) % num_domains;
+            let domain = &mut self.domains[domain_idx];
             for dst_mr in dst_mrs {
-                let (dst_addr, dst_rkey) = &dst_mr.addr_rkey_list[i];
+                let (dst_addr, dst_rkey) = &dst_mr.addr_rkey_list[domain_idx];
 
                 // Construct rdma op
                 let rdma_op = WriteOp::Imm(ImmWriteOp {

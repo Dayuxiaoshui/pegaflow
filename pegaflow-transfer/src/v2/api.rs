@@ -8,6 +8,7 @@ use std::{
         Arc,
         atomic::{AtomicI64, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use crate::cuda_lib::gdr::GdrFlag;
@@ -222,6 +223,22 @@ impl ImmCounter {
         while self.counter.load(Ordering::Relaxed) < 0 {
             std::hint::spin_loop();
         }
+    }
+
+    pub fn wait_timeout(&self, target: u32, timeout: Duration) -> bool {
+        let old = self.counter.fetch_sub(target as i64, Ordering::Relaxed);
+        if old >= target as i64 {
+            return true;
+        }
+        let deadline = Instant::now() + timeout;
+        while self.counter.load(Ordering::Relaxed) < 0 {
+            if Instant::now() >= deadline {
+                self.counter.fetch_add(target as i64, Ordering::Relaxed);
+                return false;
+            }
+            std::hint::spin_loop();
+        }
+        true
     }
 }
 

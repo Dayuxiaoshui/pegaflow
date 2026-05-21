@@ -24,7 +24,7 @@ use std::{
     ptr::NonNull,
     sync::atomic::{AtomicI64, Ordering},
     sync::{Arc, Mutex, OnceLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::runtime::{Handle, Runtime};
 use tonic::{
@@ -109,10 +109,15 @@ where
     value.extract()
 }
 
-fn wait_atomic_count(counter: &AtomicI64, target: i64) {
+fn wait_atomic_count(counter: &AtomicI64, target: i64, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
     while counter.load(Ordering::Acquire) < target {
+        if Instant::now() >= deadline {
+            return false;
+        }
         std::hint::spin_loop();
     }
+    true
 }
 
 fn pd_imm(req_id: &str) -> u32 {
@@ -491,7 +496,12 @@ impl PdRdmaEngine {
             submitted +=
                 self.submit_block_slice(&local, &remote, &v, false, &tx_counter, &err_counter)?;
         }
-        wait_atomic_count(&tx_counter, submitted);
+        if !py.detach(|| wait_atomic_count(&tx_counter, submitted, Duration::from_secs(30))) {
+            return Err(PegaFlowError::new_err(format!(
+                "RDMA WRITE timed out for req={req_id} layer={layer_idx} submitted={submitted} completed={}",
+                tx_counter.load(Ordering::Acquire)
+            )));
+        }
         let errors = err_counter.load(Ordering::Acquire);
         if errors != 0 {
             return Err(PegaFlowError::new_err(format!(
@@ -501,7 +511,7 @@ impl PdRdmaEngine {
         Ok(())
     }
 
-    fn push_done(&self, req_id: String) -> PyResult<()> {
+    fn push_done(&self, py: Python<'_>, req_id: String) -> PyResult<()> {
         let remote = self
             .remote_requests
             .lock()
@@ -537,7 +547,12 @@ impl PdRdmaEngine {
                 Arc::clone(&err_counter),
             )
             .map_err(|err| pd_rdma_error("submit IMM failed", err))?;
-        wait_atomic_count(&tx_counter, 1);
+        if !py.detach(|| wait_atomic_count(&tx_counter, 1, Duration::from_secs(30))) {
+            return Err(PegaFlowError::new_err(format!(
+                "RDMA IMM timed out for req={req_id} completed={}",
+                tx_counter.load(Ordering::Acquire)
+            )));
+        }
         let errors = err_counter.load(Ordering::Acquire);
         if errors != 0 {
             return Err(PegaFlowError::new_err(format!(
@@ -548,7 +563,39 @@ impl PdRdmaEngine {
         Ok(())
     }
 
-    fn wait_done(&self, req_id: String) {
+    fn wait_done(&self, py: Python<'_>, req_id: String) -> PyResult<()> {
+        let remote_request_id = self
+            .remote_requests
+            .lock()
+            .unwrap()
+            .get(&req_id)
+            .map(|request| request.remote_request_id.clone())
+            .unwrap_or_else(|| req_id.clone());
+        if self.finished_recving.lock().unwrap().remove(&req_id) {
+            self.finished_recving.lock().unwrap().insert(req_id);
+            return Ok(());
+        }
+        let counter = self
+            .imm_counters
+            .lock()
+            .unwrap()
+            .entry(req_id.clone())
+            .or_insert_with(|| self.engine.get_imm_counter(pd_imm(&remote_request_id)))
+            .clone();
+        let done = py.detach(|| counter.wait_timeout(1, Duration::from_secs(30)));
+        if !done {
+            return Err(PegaFlowError::new_err(format!(
+                "RDMA IMM wait timed out for req={req_id} remote_request_id={remote_request_id}"
+            )));
+        }
+        self.finished_recving.lock().unwrap().insert(req_id);
+        Ok(())
+    }
+
+    fn poll_done(&self, req_id: String) -> bool {
+        if self.finished_recving.lock().unwrap().contains(&req_id) {
+            return true;
+        }
         let remote_request_id = self
             .remote_requests
             .lock()
@@ -563,11 +610,11 @@ impl PdRdmaEngine {
             .entry(req_id.clone())
             .or_insert_with(|| self.engine.get_imm_counter(pd_imm(&remote_request_id)))
             .clone();
-        counter.wait(1);
-        self.finished_recving
-            .lock()
-            .unwrap()
-            .insert(remote_request_id);
+        if counter.wait_timeout(1, Duration::ZERO) {
+            self.finished_recving.lock().unwrap().insert(req_id);
+            return true;
+        }
+        false
     }
 
     fn mark_done(&self, req_id: String) {
@@ -583,7 +630,10 @@ impl PdRdmaEngine {
     }
 
     fn close_request(&self, req_id: String) {
-        self.remote_requests.lock().unwrap().remove(&req_id);
+        if let Some(request) = self.remote_requests.lock().unwrap().remove(&req_id) {
+            self.engine
+                .remove_imm_count(pd_imm(&request.remote_request_id));
+        }
         self.imm_counters.lock().unwrap().remove(&req_id);
         self.finished_sending.lock().unwrap().remove(&req_id);
         self.finished_recving.lock().unwrap().remove(&req_id);

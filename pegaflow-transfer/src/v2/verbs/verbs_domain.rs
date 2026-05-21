@@ -1064,7 +1064,7 @@ impl VerbsDomain {
                     .expect("TODO: handle error. maybe make ImmRecv a Op");
 
                 // Return different types of completions.
-                let imm = unsafe { wc.__bindgen_anon_1.imm_data };
+                let imm = u32::from_be(unsafe { wc.__bindgen_anon_1.imm_data });
                 match self.imm_count_map.inc(imm) {
                     ImmCountStatus::Vacant => Some(DomainCompletionEntry::ImmData(imm)),
                     ImmCountStatus::NotReached => None,

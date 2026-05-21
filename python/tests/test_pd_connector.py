@@ -38,7 +38,7 @@ from pegaflow.pd_connector.proxy import (  # noqa: E402
     ProxyConfig,
     build_pd_proxy_request,
 )
-from pegaflow.pd_connector.rdma import RealRdmaPort  # noqa: E402
+from pegaflow.pd_connector.rdma import MockRdmaPort, RealRdmaPort  # noqa: E402
 from pegaflow.pd_connector.scheduler import PdSchedulerConnector  # noqa: E402
 from pegaflow.pd_connector.worker import PdWorkerConnector  # noqa: E402
 
@@ -122,6 +122,7 @@ class FakeNativeRdmaEngine:
         assert handshake["request_id"]
         for layer in handshake["layers"]:
             assert layer["mr_desc"]["addr_rkey_list"]
+            assert isinstance(layer["mr_desc"]["addr_rkey_list"][0], tuple)
             assert (
                 len(layer["block_ids"])
                 == len(layer["k_block_addrs"])
@@ -141,6 +142,9 @@ class FakeNativeRdmaEngine:
 
     def wait_done(self, req_id):
         self.waited_reqs.append(req_id)
+
+    def poll_done(self, req_id):
+        return req_id in self.finished_recving
 
     def mark_done(self, req_id):
         self.marked_reqs.append(req_id)
@@ -314,12 +318,51 @@ def test_pd_worker_builds_native_rdma_by_default_when_extension_exists(monkeypat
     }
 
 
+def test_pd_worker_wait_handshake_uses_registered_native_mr_desc() -> None:
+    tensor = FakeTensor(
+        shape=(2, 8, 16, 4, 32),
+        stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+    )
+    native_engine = FakeNativeRdmaEngine()
+    worker = PdWorkerConnector(
+        SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(engine_id="decode"),
+            parallel_config=SimpleNamespace(tensor_parallel_rank=0, tensor_parallel_size=1),
+        ),
+        rdma=RealRdmaPort(native_engine),
+    )
+    worker.register_kv_caches({"layer.0": tensor})
+    meta = PdConnectorMetadata(
+        reqs_to_wait={
+            "req-1": WaitReqMeta(
+                local_block_ids=([1],),
+                remote=RemoteEndpoint(engine_id="prefill"),
+                remote_request_id="req-1-p",
+                done_request_id="req-1-d",
+                num_prompt_tokens=3,
+                prompt_token_ids=(11, 12, 13),
+                model="/data/Qwen3-4B",
+            )
+        }
+    )
+
+    worker.start_load_kv(meta, None)
+
+    _, handshake = native_engine.remote_regs[-1]
+    layer = handshake["layers"][0]
+    assert layer["mr_desc"] == {
+        "ptr": tensor.data_ptr(),
+        "addr_rkey_list": [("10.0.0.1:1", 17)],
+    }
+    assert layer["block_ids"] == [1]
+
+
 def test_pd_worker_pushes_flash_attn_hnd_blocks() -> None:
     tensor = FakeTensor(
         shape=(2, 8, 16, 4, 32),
         stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
     )
-    worker = PdWorkerConnector(SimpleNamespace())
+    worker = PdWorkerConnector(SimpleNamespace(), rdma=MockRdmaPort())
     worker.register_kv_caches({"layer.0": tensor, "layer.1": tensor})
     meta = PdConnectorMetadata(
         reqs_to_push={
@@ -356,6 +399,7 @@ def test_pd_worker_publishes_wait_handshake_and_delays_done_until_all_blocks() -
             kv_transfer_config=SimpleNamespace(engine_id="decode"),
             parallel_config=SimpleNamespace(tensor_parallel_rank=0, tensor_parallel_size=1),
         ),
+        rdma=MockRdmaPort(),
         oob=oob,
     )
     worker.register_kv_caches({"layer.0": tensor, "layer.1": tensor})
@@ -396,7 +440,7 @@ def test_pd_worker_publishes_wait_handshake_and_delays_done_until_all_blocks() -
     assert producer_handshake["request_id"] == "req-1"
     assert producer_handshake["layers"][0]["block_ids"] == [1, 2]
 
-    push_worker = PdWorkerConnector(SimpleNamespace(), oob=oob)
+    push_worker = PdWorkerConnector(SimpleNamespace(), rdma=MockRdmaPort(), oob=oob)
     push_worker.register_kv_caches({"layer.0": tensor, "layer.1": tensor})
     push_meta = PdConnectorMetadata(
         reqs_to_push={
@@ -567,6 +611,7 @@ def test_scheduler_registers_remote_wait_once_until_done() -> None:
     scheduler.update_connector_output(
         SimpleNamespace(finished_sending=None, finished_recving={"req-1"})
     )
+    assert scheduler.get_num_new_matched_tokens(request, num_computed_tokens=2) == (0, False)
     scheduler.update_state_after_alloc(request, ([1],), num_external_tokens=3)
     third = scheduler.build_connector_meta(SimpleNamespace())
     assert third.reqs_to_wait == {}
@@ -589,6 +634,7 @@ def test_d_worker_submits_prefill_request_after_alloc() -> None:
             kv_transfer_config=SimpleNamespace(engine_id="decode"),
             parallel_config=SimpleNamespace(tensor_parallel_rank=0, tensor_parallel_size=1),
         ),
+        rdma=MockRdmaPort(),
         prefill_sender=prefill_sender,
     )
     worker.register_kv_caches({"layer.0": tensor})

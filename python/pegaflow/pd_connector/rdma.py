@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
 from typing import Any, Protocol
 
 from pegaflow.logging_utils import get_connector_logger
@@ -35,6 +34,8 @@ class RdmaPort(Protocol):
 
     def wait_done(self, req_id: str) -> None: ...
 
+    def poll_done(self, req_id: str) -> bool: ...
+
     def mark_done(self, req_id: str) -> None: ...
 
     def pop_finished_sending(self) -> set[str]: ...
@@ -42,14 +43,14 @@ class RdmaPort(Protocol):
     def pop_finished_recving(self) -> set[str]: ...
 
 
-class NoopRdmaPort:
-    """A non-blocking RDMA stub that records calls and completes immediately."""
+class MockRdmaPort:
+    """A test double that records RDMA calls without touching native verbs."""
 
     def __init__(self) -> None:
         self.local_layers: tuple[LayerRemoteLayout, ...] = ()
         self.registered: set[str] = set()
         self.remote_handshakes: dict[str, PdHandshake | None] = {}
-        self.pushed_layers: dict[str, list[tuple[int, list[LayerBlockSlices]]]] = defaultdict(list)
+        self.pushed_layers: dict[str, list[tuple[int, list[LayerBlockSlices]]]] = {}
         self._finished_sending: set[str] = set()
         self._finished_recving: set[str] = set()
 
@@ -69,6 +70,7 @@ class NoopRdmaPort:
         layer_idx: int,
         blocks: list[LayerBlockSlices],
     ) -> None:
+        self.pushed_layers.setdefault(req_id, [])
         self.pushed_layers[req_id].append((layer_idx, blocks))
 
     def push_done(self, req_id: str) -> None:
@@ -76,6 +78,9 @@ class NoopRdmaPort:
 
     def wait_done(self, req_id: str) -> None:
         return None
+
+    def poll_done(self, req_id: str) -> bool:
+        return req_id in self._finished_recving
 
     def mark_done(self, req_id: str) -> None:
         self._finished_recving.add(req_id)
@@ -89,10 +94,6 @@ class NoopRdmaPort:
         finished = self._finished_recving
         self._finished_recving = set()
         return finished
-
-
-class MockRdmaPort(NoopRdmaPort):
-    """Alias for now; later tests can add stricter copy semantics here."""
 
 
 def _block_slice_to_native(block: BlockSlice) -> dict[str, int]:
@@ -122,7 +123,7 @@ def _layer_to_native(layer: LayerRemoteLayout) -> dict[str, Any]:
         "block_ids": list(layer.block_ids),
         "k_block_addrs": list(layer.k_block_addrs),
         "v_block_addrs": list(layer.v_block_addrs),
-        "mr_desc": layer.mr_desc,
+        "mr_desc": _mr_desc_to_native(layer.mr_desc),
     }
 
 
@@ -148,7 +149,24 @@ def _layer_from_native(layer: LayerRemoteLayout | dict[str, Any]) -> LayerRemote
 
 
 def _handshake_to_native(handshake: PdHandshake | None) -> dict[str, Any] | None:
-    return handshake_to_dict(handshake)
+    if handshake is None:
+        return None
+    data = handshake_to_dict(handshake)
+    assert data is not None
+    data["layers"] = [_layer_to_native(layer) for layer in handshake.layers]
+    return data
+
+
+def _mr_desc_to_native(mr_desc: Any | None) -> Any | None:
+    if not isinstance(mr_desc, dict):
+        return mr_desc
+    addr_rkey_list = mr_desc.get("addr_rkey_list")
+    if addr_rkey_list is None:
+        return mr_desc
+    return {
+        **mr_desc,
+        "addr_rkey_list": [(str(addr_rkey[0]), int(addr_rkey[1])) for addr_rkey in addr_rkey_list],
+    }
 
 
 class RealRdmaPort:
@@ -189,6 +207,12 @@ class RealRdmaPort:
             return None
         return wait_done(req_id)
 
+    def poll_done(self, req_id: str) -> bool:
+        poll_done = getattr(self.engine, "poll_done", None)
+        if poll_done is None:
+            return False
+        return bool(poll_done(req_id))
+
     def mark_done(self, req_id: str) -> None:
         mark_done = getattr(self.engine, "mark_done", None)
         if mark_done is None:
@@ -206,21 +230,14 @@ def build_rdma_port(vllm_config: Any, cuda_device: int | None) -> RdmaPort:
     config = getattr(vllm_config, "kv_transfer_config", None)
     enabled = _extra(config, "pegaflow.pd.rdma.enabled", _MISSING)
     if enabled is not _MISSING and not _as_bool(enabled):
-        logger.info("[PdConnector] native RDMA disabled by kv_transfer_config")
-        return NoopRdmaPort()
+        raise RuntimeError("PdConnector requires native RDMA; pegaflow.pd.rdma.enabled=false")
 
     try:
         from pegaflow.pegaflow import PdRdmaEngine
-    except ImportError:
-        if enabled is not _MISSING:
-            raise
-        logger.warning("[PdConnector] native RDMA extension is unavailable; using NoopRdmaPort")
-        return NoopRdmaPort()
+    except ImportError as exc:
+        raise RuntimeError("PdConnector requires native RDMA extension pegaflow.pegaflow") from exc
     except AttributeError as exc:
-        if enabled is not _MISSING:
-            raise RuntimeError("pegaflow.pegaflow does not expose PdRdmaEngine") from exc
-        logger.warning("[PdConnector] native PdRdmaEngine is unavailable; using NoopRdmaPort")
-        return NoopRdmaPort()
+        raise RuntimeError("pegaflow.pegaflow does not expose PdRdmaEngine") from exc
 
     device = _extra(config, "pegaflow.pd.rdma.device", "cuda")
     configured_cuda_device = _extra(config, "pegaflow.pd.rdma.cuda_device", None)
