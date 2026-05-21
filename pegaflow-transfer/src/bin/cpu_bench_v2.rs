@@ -292,6 +292,21 @@ fn main() {
     );
 
     let topology = detect_topology().expect("v2 topology detection failed");
+    let detected_domains = topology
+        .iter()
+        .map(|group| group.domains.len())
+        .sum::<usize>();
+    let detected_cuda_devices = topology
+        .iter()
+        .map(|group| group.cuda_device)
+        .collect::<HashSet<_>>()
+        .len();
+    println!(
+        "topology detected: groups={} cuda_devices={} domains={}",
+        topology.len(),
+        detected_cuda_devices,
+        detected_domains
+    );
     let include_domains: BTreeSet<String> = cli.domains.iter().cloned().collect();
     let exclude_domains: BTreeSet<String> = cli.exclude_domain.iter().cloned().collect();
 

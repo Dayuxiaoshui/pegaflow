@@ -14,6 +14,7 @@ use crate::v2::{
     provider_dispatch::DomainInfo,
     verbs::{VerbsDeviceInfo, VerbsDeviceList},
 };
+use log::warn;
 
 #[derive(Clone)]
 pub struct TopologyGroup {
@@ -293,12 +294,13 @@ fn scan_all_pci_devices() -> Result<Vec<PciProp>> {
         let pci_device_id = read_pci_device_id(&addr)?;
 
         let numa_node_path = parent_bus.get_sys_path() + "/numa_node";
-        let numa_node = std::fs::read_to_string(numa_node_path)
-            .map_err(|_| FabricLibError::Custom("Failed to read NUMA node"))?
-            .trim()
-            .parse::<usize>();
-        let Ok(numa_node) = numa_node else {
+        let Ok(numa_node) = std::fs::read_to_string(numa_node_path) else {
+            warn!("Skipping PCI device {addr} because parent bus {parent_bus} has no NUMA node");
+            continue;
+        };
+        let Ok(numa_node) = numa_node.trim().parse::<usize>() else {
             // NOTE: /sys/bus/pci/devices/0000:00:00.0/numa_node can be -1.
+            warn!("Skipping PCI device {addr} because parent bus {parent_bus} has no NUMA node");
             continue;
         };
         all_pcis.push(PciProp {
