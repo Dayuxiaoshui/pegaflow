@@ -427,13 +427,23 @@ fn detect_system_topo(
     let mut system_topo = Vec::new();
     let mut numa_gpu_indices = vec![0; numa_cpus.len()];
     for switch in switch_groups.into_iter() {
+        if switch.nics.is_empty() {
+            continue;
+        }
         let nics_per_gpu = switch.nics.len() / switch.gpus.len();
         for (i_gpu, gpu) in switch.gpus.iter().enumerate() {
             let gpu_numa_node = gpu
                 .numa_node
                 .expect("GPU without NUMA node should be filtered");
             // Assign NICs to GPUs
-            let nics = &switch.nics[i_gpu * nics_per_gpu..(i_gpu + 1) * nics_per_gpu];
+            let nics = if nics_per_gpu == 0 {
+                vec![switch.nics[i_gpu % switch.nics.len()].clone()]
+            } else {
+                switch.nics[i_gpu * nics_per_gpu..(i_gpu + 1) * nics_per_gpu]
+                    .iter()
+                    .map(|nic| (*nic).clone())
+                    .collect()
+            };
 
             // Assign CPUs to GPUs
             let numa_gpu_index = numa_gpu_indices[gpu_numa_node];
@@ -443,7 +453,7 @@ fn detect_system_topo(
             let cpus = &numa_cpus[gpu_numa_node][cpu_start..cpu_start + cpus_per_gpu];
             system_topo.push(PciTopoGroup {
                 gpu: (*gpu).clone(),
-                nics: nics.iter().map(|x| (*x).clone()).collect(),
+                nics,
                 cpus: cpus.to_vec(),
             });
         }
