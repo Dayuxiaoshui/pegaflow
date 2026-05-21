@@ -42,6 +42,7 @@ class PdSchedulerConnector:
         self._reqs_to_wait: dict[str, WaitReqMeta] = {}
         self._reqs_to_push: dict[str, PushReqMeta] = {}
         self._reqs_to_release: set[str] = set()
+        self._active_wait_reqs: set[str] = set()
         self._pending_producer_reqs: set[str] = set()
 
     def get_num_new_matched_tokens(
@@ -67,6 +68,10 @@ class PdSchedulerConnector:
         local_block_ids = normalize_block_ids(blocks)
 
         if params.get("do_remote_prefill"):
+            if req_id in self._active_wait_reqs:
+                logger.debug("[PdConnector] scheduler wait req=%s already active", req_id)
+                return
+            self._active_wait_reqs.add(req_id)
             self._reqs_to_wait[req_id] = WaitReqMeta(
                 local_block_ids=local_block_ids,
                 remote=RemoteEndpoint(
@@ -129,6 +134,7 @@ class PdSchedulerConnector:
             self._pending_producer_reqs.discard(req_id)
             logger.debug("[PdConnector] finished sending req=%s", req_id)
         for req_id in connector_output.finished_recving or ():
+            self._active_wait_reqs.discard(req_id)
             logger.debug("[PdConnector] finished recving req=%s", req_id)
 
     def request_finished(
@@ -141,6 +147,7 @@ class PdSchedulerConnector:
         is_producer = bool(params.get("do_remote_prefill_sender") or params.get("pd_push_producer"))
         if params.get("do_remote_prefill") or is_producer:
             self._reqs_to_release.add(req_id)
+            self._active_wait_reqs.discard(req_id)
         if is_producer and _has_blocks(block_ids):
             self._pending_producer_reqs.add(req_id)
             return True, None

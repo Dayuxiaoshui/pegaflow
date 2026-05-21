@@ -83,6 +83,9 @@ class PdWorkerConnector:
         **kwargs: Any,
     ) -> None:
         for req_id, req in metadata.reqs_to_wait.items():
+            if req_id in self._wait_reqs:
+                logger.debug("[PdConnector] D wait req=%s already registered", req_id)
+                continue
             self._wait_reqs[req_id] = req
             self._done_aliases[req.done_request_id] = req_id
             if req.remote.done_endpoint:

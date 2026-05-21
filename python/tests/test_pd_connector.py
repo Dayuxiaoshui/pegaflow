@@ -277,6 +277,38 @@ def test_scheduler_carries_fake_rdma_done_endpoint() -> None:
     assert meta.reqs_to_wait["req-1"].done_request_id == "req-1"
 
 
+def test_scheduler_registers_remote_wait_once_until_done() -> None:
+    scheduler = PdSchedulerConnector(
+        SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="d"))
+    )
+    request = SimpleNamespace(
+        request_id="req-1",
+        num_prompt_tokens=3,
+        prompt_token_ids=[11, 12, 13],
+        kv_transfer_params={
+            "do_remote_prefill": True,
+            "remote_engine_id": "prefill",
+            "prefill_url": "http://127.0.0.1:8001",
+            "done_endpoint": "tcp://127.0.0.1:7200",
+        },
+    )
+
+    scheduler.update_state_after_alloc(request, ([1],), num_external_tokens=3)
+    first = scheduler.build_connector_meta(SimpleNamespace())
+    scheduler.update_state_after_alloc(request, ([1],), num_external_tokens=3)
+    second = scheduler.build_connector_meta(SimpleNamespace())
+
+    assert set(first.reqs_to_wait) == {"req-1"}
+    assert second.reqs_to_wait == {}
+
+    scheduler.update_connector_output(
+        SimpleNamespace(finished_sending=None, finished_recving={"req-1"})
+    )
+    scheduler.update_state_after_alloc(request, ([1],), num_external_tokens=3)
+    third = scheduler.build_connector_meta(SimpleNamespace())
+    assert set(third.reqs_to_wait) == {"req-1"}
+
+
 def test_d_worker_submits_prefill_request_after_alloc() -> None:
     tensor = FakeTensor(
         shape=(2, 8, 16, 4, 32),
