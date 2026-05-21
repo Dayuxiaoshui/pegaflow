@@ -76,6 +76,14 @@ class FakeSlotMapping(list[int]):
         return list(self)
 
 
+class FakePrefillSender:
+    def __init__(self) -> None:
+        self.tasks = []
+
+    def submit(self, task) -> None:
+        self.tasks.append(task)
+
+
 def test_flash_attn_hnd_layout_offsets() -> None:
     # Logical shape [2, num_blocks, block_size, num_kv_heads, head_size].
     # HND physical order [2, num_blocks, num_kv_heads, block_size, head_size].
@@ -146,6 +154,7 @@ def test_pd_worker_publishes_wait_handshake_and_delays_done_until_all_blocks() -
                 done_request_id="req-1",
                 num_prompt_tokens=32,
                 prompt_token_ids=(101, 102, 103),
+                model="/data/Qwen3-4B",
             )
         }
     )
@@ -268,6 +277,55 @@ def test_scheduler_carries_fake_rdma_done_endpoint() -> None:
     assert meta.reqs_to_wait["req-1"].done_request_id == "req-1"
 
 
+def test_d_worker_submits_prefill_request_after_alloc() -> None:
+    tensor = FakeTensor(
+        shape=(2, 8, 16, 4, 32),
+        stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+    )
+    prefill_sender = FakePrefillSender()
+    worker = PdWorkerConnector(
+        SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(engine_id="decode"),
+            parallel_config=SimpleNamespace(tensor_parallel_rank=0, tensor_parallel_size=1),
+        ),
+        prefill_sender=prefill_sender,
+    )
+    worker.register_kv_caches({"layer.0": tensor})
+    meta = PdConnectorMetadata(
+        reqs_to_wait={
+            "internal-d": WaitReqMeta(
+                local_block_ids=([1],),
+                remote=RemoteEndpoint(
+                    engine_id="prefill",
+                    done_endpoint="tcp://127.0.0.1:7200",
+                ),
+                remote_request_id="external-p",
+                done_request_id="external-d",
+                num_prompt_tokens=3,
+                prompt_token_ids=(11, 12, 13),
+                model="/data/Qwen3-4B",
+                prefill_url="http://127.0.0.1:8001",
+                prefill_max_tokens=1,
+            )
+        }
+    )
+
+    worker.start_load_kv(meta, None)
+
+    assert len(prefill_sender.tasks) == 1
+    task = prefill_sender.tasks[0]
+    assert task.request_id == "external-p"
+    assert task.prefill_url == "http://127.0.0.1:8001"
+    assert task.model == "/data/Qwen3-4B"
+    assert task.prompt_token_ids == (11, 12, 13)
+    assert task.kv_transfer_params == {
+        "do_remote_prefill_sender": True,
+        "target_engine_id": "decode",
+        "target_request_id": "external-d",
+        "done_endpoint": "tcp://127.0.0.1:7200",
+    }
+
+
 def test_pd_proxy_only_sends_decode_request_with_prefill_hint() -> None:
     config = ProxyConfig(
         prefill_url="http://127.0.0.1:8001",
@@ -291,6 +349,7 @@ def test_pd_proxy_only_sends_decode_request_with_prefill_hint() -> None:
     assert req.decode_body["max_tokens"] == 4
     assert req.decode_body["kv_transfer_params"] == {
         "do_remote_prefill": True,
+        "model": "/data/Qwen3-4B",
         "prefill_url": "http://127.0.0.1:8001",
         "prefill_max_tokens": 1,
         "remote_engine_id": "prefill",

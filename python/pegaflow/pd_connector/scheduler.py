@@ -84,6 +84,9 @@ class PdSchedulerConnector:
                 ),
                 num_prompt_tokens=_num_prompt_tokens(request),
                 prompt_token_ids=_prompt_token_ids(request),
+                model=str(params.get("model") or getattr(request, "model", "") or ""),
+                prefill_url=params.get("prefill_url"),
+                prefill_max_tokens=int(params.get("prefill_max_tokens", 1)),
             )
             logger.debug(
                 "[PdConnector] scheduler wait req=%s blocks=%d", req_id, _count(local_block_ids)

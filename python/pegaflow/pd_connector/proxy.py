@@ -57,6 +57,7 @@ def build_pd_proxy_request(
     decode_body["stream"] = False
     decode_body["kv_transfer_params"] = {
         "do_remote_prefill": True,
+        "model": str(body.get("model", "")),
         "prefill_url": config.prefill_url,
         "prefill_max_tokens": int(body.get("pd_prefill_max_tokens", config.prefill_max_tokens)),
         "remote_engine_id": "prefill",

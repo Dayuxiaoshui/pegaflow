@@ -694,7 +694,7 @@ curl -s http://127.0.0.1:8100/v1/completions \
 验收先看三份日志：
 - `proxy.log`：应出现 `request=... -> D`、`D completed`，不应出现 `request=... -> P`；
 - `p.log`：应出现 `P queued async push`、`P finished fake RDMA push`、`P sent fake RDMA done`；
-- `d.log`：应出现 `D queued async wait`、`fake RDMA done receiver listening`、`D received fake RDMA done`。
+- `d.log`：应出现 `D queued async wait`、`D -> P prefill request`、`D -> P prefill completed`、`fake RDMA done receiver listening`、`D received fake RDMA done`。
 
 ### 5.2 关于 pegainfer 的统一
 

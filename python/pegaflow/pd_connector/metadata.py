@@ -53,6 +53,9 @@ class WaitReqMeta:
     done_request_id: str
     num_prompt_tokens: int
     prompt_token_ids: tuple[int, ...]
+    model: str
+    prefill_url: str | None = None
+    prefill_max_tokens: int = 1
 
 
 @dataclass(frozen=True)

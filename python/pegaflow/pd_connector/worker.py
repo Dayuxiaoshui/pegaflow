@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 import queue
 import threading
+from dataclasses import dataclass
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from pegaflow.logging_utils import get_connector_logger
 from pegaflow.pd_connector.chunk_tracker import ChunkTracker
@@ -34,6 +37,7 @@ class PdWorkerConnector:
         vllm_config: Any,
         rdma: RdmaPort | None = None,
         oob: InMemoryOobPort | None = None,
+        prefill_sender: Any | None = None,
     ) -> None:
         self.vllm_config = vllm_config
         self.rdma = rdma or NoopRdmaPort()
@@ -53,6 +57,7 @@ class PdWorkerConnector:
         self._failed_blocks: set[int] = set()
         self._done_sender = _AsyncDoneSender()
         self._done_receiver: _AsyncDoneReceiver | None = None
+        self._prefill_sender = prefill_sender or _AsyncPrefillSender()
 
     def register_kv_caches(self, kv_caches: dict[str, Any]) -> None:
         self.layouts = {
@@ -89,17 +94,33 @@ class PdWorkerConnector:
                     prompt_token_ids=req.prompt_token_ids,
                     producer_kv_transfer_params=_producer_params(
                         target_engine_id=self.engine_id,
-                        target_request_id=req_id,
+                        target_request_id=req.done_request_id,
                         done_endpoint=req.remote.done_endpoint,
                     ),
                     handshake=handshake,
                 )
             )
             self.rdma.register_remote(req_id, handshake)
+            if req.prefill_url:
+                self._prefill_sender.submit(
+                    _PrefillHttpTask(
+                        request_id=req.remote_request_id,
+                        prefill_url=req.prefill_url,
+                        model=req.model,
+                        prompt_token_ids=req.prompt_token_ids,
+                        max_tokens=req.prefill_max_tokens,
+                        kv_transfer_params=_producer_params(
+                            target_engine_id=self.engine_id,
+                            target_request_id=req.done_request_id,
+                            done_endpoint=req.remote.done_endpoint,
+                        ),
+                    )
+                )
             logger.info(
-                "[PdConnector] D queued async wait req=%s remote_req=%s done_endpoint=%s",
+                "[PdConnector] D queued async wait req=%s remote_req=%s prefill_url=%s done_endpoint=%s",
                 req_id,
                 req.remote_request_id,
+                req.prefill_url or "<oob>",
                 req.remote.done_endpoint or "<rdma>",
             )
 
@@ -223,6 +244,9 @@ class PdWorkerConnector:
             self._done_receiver.close()
             self._done_receiver = None
         self._done_sender.close()
+        close = getattr(self._prefill_sender, "close", None)
+        if close is not None:
+            close()
 
     def _layer_idx(self, layer_name: str) -> int:
         try:
@@ -362,6 +386,89 @@ class _AsyncDoneSender:
                 self._queue.task_done()
         for socket in sockets.values():
             socket.close(linger=0)
+
+
+@dataclass(frozen=True)
+class _PrefillHttpTask:
+    request_id: str
+    prefill_url: str
+    model: str
+    prompt_token_ids: tuple[int, ...]
+    max_tokens: int
+    kv_transfer_params: dict[str, Any]
+
+
+class _AsyncPrefillSender:
+    def __init__(self) -> None:
+        self._queue: queue.Queue[_PrefillHttpTask | None] = queue.Queue()
+        self._thread = threading.Thread(target=self._run, name="pd-prefill-sender", daemon=True)
+        self._thread.start()
+
+    def submit(self, task: _PrefillHttpTask) -> None:
+        self._queue.put(task)
+
+    def close(self) -> None:
+        self._queue.put(None)
+
+    def _run(self) -> None:
+        while True:
+            task = self._queue.get()
+            try:
+                if task is None:
+                    return
+                _post_prefill_request(task)
+            finally:
+                self._queue.task_done()
+
+
+def _post_prefill_request(task: _PrefillHttpTask) -> None:
+    url = task.prefill_url.rstrip("/") + "/v1/completions"
+    body = {
+        "model": task.model,
+        "prompt": list(task.prompt_token_ids),
+        "max_tokens": task.max_tokens,
+        "temperature": 0,
+        "stream": False,
+        "request_id": task.request_id,
+        "kv_transfer_params": task.kv_transfer_params,
+    }
+    payload = json.dumps(body).encode()
+    logger.info(
+        "[PdConnector] D -> P prefill request req=%s url=%s tokens=%d target_req=%s",
+        task.request_id,
+        url,
+        len(task.prompt_token_ids),
+        task.kv_transfer_params.get("target_request_id"),
+    )
+    request = Request(
+        url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=600) as response:
+            response_body = response.read()
+            logger.info(
+                "[PdConnector] D -> P prefill completed req=%s status=%s bytes=%d",
+                task.request_id,
+                response.status,
+                len(response_body),
+            )
+    except HTTPError as exc:
+        response_body = exc.read()
+        logger.error(
+            "[PdConnector] D -> P prefill failed req=%s status=%s body=%s",
+            task.request_id,
+            exc.code,
+            response_body[:512],
+        )
+    except URLError:
+        logger.exception(
+            "[PdConnector] D -> P prefill connection failed req=%s url=%s",
+            task.request_id,
+            url,
+        )
 
 
 def _producer_params(
