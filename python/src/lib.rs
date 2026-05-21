@@ -5,10 +5,10 @@ use pegaflow_proto::proto::engine::{
     UnregisterRequest, engine_client::EngineClient, query_response,
 };
 use pegaflow_transfer::v2::{
-    CudaDeviceId, CudaDeviceMemory, Device, DomainAddress, DomainGroupRouting, ImmTransferRequest,
-    MemoryRegionDescriptor, MemoryRegionHandle, MemoryRegionRemoteKey, RdmaEngine,
-    SingleTransferRequest, SmallVec, TransferEngine, TransferEngineBuilder, TransferRequest,
-    detect_topology,
+    CudaDeviceId, CudaDeviceMemory, Device, DomainAddress, DomainGroupRouting, ImmCounter,
+    ImmTransferRequest, MemoryRegionDescriptor, MemoryRegionHandle, MemoryRegionRemoteKey,
+    RdmaEngine, SingleTransferRequest, SmallVec, TransferEngine, TransferEngineBuilder,
+    TransferRequest, detect_topology,
 };
 use pyo3::{
     create_exception,
@@ -190,6 +190,7 @@ struct PdRdmaEngine {
     imm_domain: DomainGroupRouting,
     local_layers: Mutex<HashMap<u64, PdLocalLayer>>,
     remote_requests: Mutex<HashMap<String, PdRemoteRequest>>,
+    imm_counters: Mutex<HashMap<String, ImmCounter>>,
     imm_to_req: Arc<Mutex<HashMap<u32, String>>>,
     finished_sending: Arc<Mutex<HashSet<String>>>,
     finished_recving: Arc<Mutex<HashSet<String>>>,
@@ -320,6 +321,7 @@ impl PdRdmaEngine {
             imm_domain: DomainGroupRouting::Pinned { domain_idx: 0 },
             local_layers: Mutex::new(HashMap::new()),
             remote_requests: Mutex::new(HashMap::new()),
+            imm_counters: Mutex::new(HashMap::new()),
             imm_to_req,
             finished_sending: Arc::new(Mutex::new(HashSet::new())),
             finished_recving,
@@ -390,6 +392,11 @@ impl PdRdmaEngine {
         let remote_request_id: String = py_get(handshake, "request_id")?;
         let imm = pd_imm(&remote_request_id);
         self.imm_to_req.lock().unwrap().insert(imm, req_id.clone());
+        self.imm_counters
+            .lock()
+            .unwrap()
+            .entry(req_id.clone())
+            .or_insert_with(|| self.engine.get_imm_counter(imm));
 
         let layers_any = handshake
             .get_item("layers")?
@@ -548,10 +555,15 @@ impl PdRdmaEngine {
             .unwrap()
             .get(&req_id)
             .map(|request| request.remote_request_id.clone())
-            .unwrap_or(req_id);
-        self.engine
-            .get_imm_counter(pd_imm(&remote_request_id))
-            .wait(1);
+            .unwrap_or_else(|| req_id.clone());
+        let counter = self
+            .imm_counters
+            .lock()
+            .unwrap()
+            .entry(req_id.clone())
+            .or_insert_with(|| self.engine.get_imm_counter(pd_imm(&remote_request_id)))
+            .clone();
+        counter.wait(1);
         self.finished_recving
             .lock()
             .unwrap()
@@ -572,6 +584,7 @@ impl PdRdmaEngine {
 
     fn close_request(&self, req_id: String) {
         self.remote_requests.lock().unwrap().remove(&req_id);
+        self.imm_counters.lock().unwrap().remove(&req_id);
         self.finished_sending.lock().unwrap().remove(&req_id);
         self.finished_recving.lock().unwrap().remove(&req_id);
     }
