@@ -83,9 +83,13 @@ def _install_vllm_stubs() -> None:
     class KVConnectorMetadata:
         return_none: bool = False
 
+    class SupportsHMA:
+        pass
+
     base.KVConnectorRole = KVConnectorRole
     base.KVConnectorBase_V1 = KVConnectorBase_V1
     base.KVConnectorMetadata = KVConnectorMetadata
+    base.SupportsHMA = SupportsHMA
 
     metrics = _ensure_module("vllm.distributed.kv_transfer.kv_connector.v1.metrics")
 
