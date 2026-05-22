@@ -5,10 +5,11 @@ use pegaflow_proto::proto::engine::{
     UnregisterRequest, engine_client::EngineClient, query_response,
 };
 use pegaflow_transfer::v2::{
-    CudaDeviceId, CudaDeviceMemory, Device, DomainAddress, DomainGroupRouting,
+    CudaDeviceId, CudaDeviceMemory, Device, DomainAddress, DomainGroupRouting, FabricLibError,
     GroupTransferRouting, ImmCounter, ImmTransferRequest, MemoryRegionDescriptor,
     MemoryRegionHandle, MemoryRegionRemoteKey, RdmaEngine, ScatterTarget, ScatterTransferRequest,
-    SmallVec, TransferEngine, TransferEngineBuilder, TransferRequest, detect_topology,
+    SmallVec, TransferCallback, TransferEngine, TransferEngineBuilder, TransferRequest,
+    detect_topology,
 };
 use pyo3::{
     create_exception,
@@ -36,6 +37,7 @@ create_exception!(pegaflow, PegaFlowError, PyException);
 create_exception!(pegaflow, PegaflowInternal, PegaFlowError);
 
 static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();
+const PD_RDMA_WRITE_WINDOW: i64 = 64;
 
 /// Get or create the global Tokio runtime (shared across all RPC calls)
 fn get_runtime() -> PyResult<&'static Runtime> {
@@ -119,6 +121,22 @@ fn wait_atomic_count(counter: &AtomicI64, target: i64, timeout: Duration) -> boo
     true
 }
 
+fn wait_write_window(
+    submitted: &AtomicI64,
+    completed: &AtomicI64,
+    limit: i64,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    while submitted.load(Ordering::Acquire) - completed.load(Ordering::Acquire) >= limit {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::hint::spin_loop();
+    }
+    true
+}
+
 fn pd_imm(req_id: &str) -> u32 {
     let mut hash = 0x811c_9dc5u32;
     for byte in req_id.as_bytes() {
@@ -147,6 +165,23 @@ struct PdRemoteRequest {
     remote_request_id: String,
     imm_data: u32,
     layers: HashMap<u64, PdRemoteLayer>,
+}
+
+#[derive(Clone)]
+struct PendingRdmaWrites {
+    submitted: i64,
+    completed: Arc<AtomicI64>,
+    errors: Arc<AtomicI64>,
+}
+
+impl PendingRdmaWrites {
+    fn new() -> Self {
+        Self {
+            submitted: 0,
+            completed: Arc::new(AtomicI64::new(0)),
+            errors: Arc::new(AtomicI64::new(0)),
+        }
+    }
 }
 
 #[pyclass]
@@ -195,6 +230,9 @@ struct PdRdmaEngine {
     local_layers: Mutex<HashMap<u64, PdLocalLayer>>,
     remote_requests: Mutex<HashMap<String, PdRemoteRequest>>,
     imm_counters: Mutex<HashMap<String, ImmCounter>>,
+    pending_writes: Mutex<HashMap<String, PendingRdmaWrites>>,
+    write_submitted: AtomicI64,
+    write_completed: Arc<AtomicI64>,
     imm_to_req: Arc<Mutex<HashMap<u32, String>>>,
     finished_sending: Arc<Mutex<HashSet<String>>>,
     finished_recving: Arc<Mutex<HashSet<String>>>,
@@ -321,6 +359,9 @@ impl PdRdmaEngine {
             local_layers: Mutex::new(HashMap::new()),
             remote_requests: Mutex::new(HashMap::new()),
             imm_counters: Mutex::new(HashMap::new()),
+            pending_writes: Mutex::new(HashMap::new()),
+            write_submitted: AtomicI64::new(0),
+            write_completed: Arc::new(AtomicI64::new(0)),
             imm_to_req,
             finished_sending: Arc::new(Mutex::new(HashSet::new())),
             finished_recving,
@@ -476,8 +517,6 @@ impl PdRdmaEngine {
                     "remote layer {layer_idx} for req {req_id} is not registered"
                 ))
             })?;
-        let tx_counter = Arc::new(AtomicI64::new(0));
-        let err_counter = Arc::new(AtomicI64::new(0));
         let mut dsts = Vec::with_capacity(blocks.len() * 2);
         for block in blocks {
             let block = block.bind(py);
@@ -492,42 +531,76 @@ impl PdRdmaEngine {
             dsts.push(self.block_slice_to_scatter_target(&local, &remote, &k, true)?);
             dsts.push(self.block_slice_to_scatter_target(&local, &remote, &v, false)?);
         }
-        let submitted = if dsts.is_empty() {
-            0
-        } else {
-            self.engine
-                .submit_transfer_atomic(
-                    TransferRequest::Scatter(ScatterTransferRequest {
-                        src_mr: local.mr,
-                        dst_handle: None,
-                        dsts: Arc::new(dsts),
-                        imm_data: None,
-                        domain: GroupTransferRouting::AllDomainsShardBytes,
-                    }),
-                    Arc::clone(&tx_counter),
-                    Arc::clone(&err_counter),
-                )
-                .map_err(|err| pd_rdma_error("submit RDMA WRITE failed", err))?;
-            1
+        if dsts.is_empty() {
+            return Ok(());
+        }
+        if !py.detach(|| {
+            wait_write_window(
+                &self.write_submitted,
+                &self.write_completed,
+                PD_RDMA_WRITE_WINDOW,
+                Duration::from_secs(30),
+            )
+        }) {
+            return Err(PegaFlowError::new_err(format!(
+                "RDMA WRITE window timed out for req={req_id} layer={layer_idx} submitted={} completed={}",
+                self.write_submitted.load(Ordering::Acquire),
+                self.write_completed.load(Ordering::Acquire)
+            )));
+        }
+        let (req_completed, req_errors) = {
+            let mut pending = self.pending_writes.lock().unwrap();
+            let state = pending
+                .entry(req_id.clone())
+                .or_insert_with(PendingRdmaWrites::new);
+            state.submitted += 1;
+            (Arc::clone(&state.completed), Arc::clone(&state.errors))
         };
-        if submitted != 0
-            && !py.detach(|| wait_atomic_count(&tx_counter, submitted, Duration::from_secs(30)))
-        {
-            return Err(PegaFlowError::new_err(format!(
-                "RDMA WRITE timed out for req={req_id} layer={layer_idx} submitted={submitted} completed={}",
-                tx_counter.load(Ordering::Acquire)
-            )));
-        }
-        let errors = err_counter.load(Ordering::Acquire);
-        if errors != 0 {
-            return Err(PegaFlowError::new_err(format!(
-                "RDMA WRITE failed for req={req_id} layer={layer_idx} errors={errors}"
-            )));
-        }
+        self.write_submitted.fetch_add(1, Ordering::Release);
+        let global_completed = Arc::clone(&self.write_completed);
+        let done_completed = Arc::clone(&req_completed);
+        let error_completed = Arc::clone(&req_completed);
+        let error_counter = Arc::clone(&req_errors);
+        let error_global_completed = Arc::clone(&global_completed);
+        self.engine
+            .submit_transfer(
+                TransferRequest::Scatter(ScatterTransferRequest {
+                    src_mr: local.mr,
+                    dst_handle: None,
+                    dsts: Arc::new(dsts),
+                    imm_data: None,
+                    domain: GroupTransferRouting::AllDomainsShardBytes,
+                }),
+                TransferCallback {
+                    on_done: Box::new(move || {
+                        done_completed.fetch_add(1, Ordering::Release);
+                        global_completed.fetch_add(1, Ordering::Release);
+                        Ok(())
+                    }),
+                    on_error: Box::new(move |err: FabricLibError| {
+                        error_counter.fetch_add(1, Ordering::Release);
+                        error_completed.fetch_add(1, Ordering::Release);
+                        error_global_completed.fetch_add(1, Ordering::Release);
+                        log::error!("[PdRdmaEngine] RDMA WRITE completion error: {err}");
+                        Ok(())
+                    }),
+                },
+            )
+            .map_err(|err| {
+                req_errors.fetch_add(1, Ordering::Release);
+                req_completed.fetch_add(1, Ordering::Release);
+                self.write_completed.fetch_add(1, Ordering::Release);
+                pd_rdma_error("submit RDMA WRITE failed", err)
+            })?;
         Ok(())
     }
 
+    fn wait_for_pushes(&self, py: Python<'_>, req_id: String) -> PyResult<()> {
+        self.wait_for_request_writes(py, &req_id, Duration::from_secs(30))
+    }
+
     fn push_done(&self, py: Python<'_>, req_id: String) -> PyResult<()> {
+        self.wait_for_request_writes(py, &req_id, Duration::from_secs(30))?;
         let remote = self
             .remote_requests
             .lock()
@@ -654,6 +727,7 @@ impl PdRdmaEngine {
             self.imm_to_req.lock().unwrap().remove(&request.imm_data);
         }
         self.imm_counters.lock().unwrap().remove(&req_id);
+        self.pending_writes.lock().unwrap().remove(&req_id);
         self.finished_sending.lock().unwrap().remove(&req_id);
         self.finished_recving.lock().unwrap().remove(&req_id);
     }
@@ -684,6 +758,34 @@ impl PdRdmaEngine {
 }
 
 impl PdRdmaEngine {
+    fn wait_for_request_writes(
+        &self,
+        py: Python<'_>,
+        req_id: &str,
+        timeout: Duration,
+    ) -> PyResult<()> {
+        let Some(state) = self.pending_writes.lock().unwrap().get(req_id).cloned() else {
+            return Ok(());
+        };
+        let submitted = state.submitted;
+        if submitted == 0 {
+            return Ok(());
+        }
+        if !py.detach(|| wait_atomic_count(&state.completed, submitted, timeout)) {
+            return Err(PegaFlowError::new_err(format!(
+                "RDMA WRITE timed out for req={req_id} submitted={submitted} completed={}",
+                state.completed.load(Ordering::Acquire)
+            )));
+        }
+        let errors = state.errors.load(Ordering::Acquire);
+        if errors != 0 {
+            return Err(PegaFlowError::new_err(format!(
+                "RDMA WRITE failed for req={req_id} errors={errors}"
+            )));
+        }
+        Ok(())
+    }
+
     fn block_slice_to_scatter_target(
         &self,
         local: &PdLocalLayer,

@@ -567,6 +567,10 @@ get_finished(finished_req_ids):
 - 后台 `wait_for_pushes` / `push_done` 超时后把 req_id 塞 `_failed_sends`，下一次
   `get_finished` 仍通过 `finished_sending` 上报，同时 `get_block_ids_with_load_errors`
   列出对应 block。D 端 `wait_done` 超时走对称路径上报 `finished_recving`，触发 D 本地重算。
+- D 侧 `get_finished` **不要**对 `_wait_reqs` 跑 `poll_done` for-loop。IMM 完成是 v2
+  `add_imm_callback` 在后台自动 push 进 `finished_recving` 的，主线程直接
+  `pop_finished_recving()` 即可。当前 worker.py 里那段循环对每个 pending wait 抓
+  `finished_recving`/`remote_requests`/`imm_counters` 三把锁，纯属冗余。直接删。
 
 ## 4. vLLM 接入（不 fork vllm）
 
@@ -610,36 +614,88 @@ NIXL 的关键 hook 行为对照：
 
 这意味着下一步不是在旧 connector 基础上改，而是新建 `pegaflow.pd_connector`，按 NIXL 的文件组织和 hook 分层新写。
 
-### 4.1 角色识别
+### 4.1 角色识别 + per-rank NIC/CPU 绑定
 
-通过 `--kv-transfer-config` 的 `kv_role`：
+通过 `--kv-transfer-config` 的 `kv_role` 区分 P/D。每个 TP rank 的 NIC 和 pin CPU
+**显式**写在 `pegaflow.pd.rdma.rank_map` 里——不再依赖自动拓扑探测做隐式选择，
+也不再用全局 `cuda_device` / `pin_*` config（TP>1 时所有 rank 会拿同一份全局值，
+直接抢同一张卡同一个 CPU）。
 
 ```bash
-# P 节点
+# P 节点（TP=8）
 vllm serve $MODEL \
   --no-enable-prefix-caching \               # ← 见 §3.7，第一版禁用 P 端 prefix cache
   --kv-transfer-config '{
     "kv_connector": "PdConnector",
     "kv_connector_module_path": "pegaflow.pd_connector",
     "kv_role": "kv_producer",
+    "engine_id": "prefill",
     "kv_connector_extra_config": {
-      "oob_listen": "0.0.0.0:7100",
-      "rdma_devices": ["mlx5_0","mlx5_1"]
+      "pegaflow.pd.rdma.rank_map": {
+        "0": {"nic": "mlx5_0", "worker_cpu": 16, "uvm_cpu": 17},
+        "1": {"nic": "mlx5_1", "worker_cpu": 18, "uvm_cpu": 19},
+        "2": {"nic": "mlx5_2", "worker_cpu": 20, "uvm_cpu": 21},
+        "3": {"nic": "mlx5_3", "worker_cpu": 22, "uvm_cpu": 23},
+        "4": {"nic": "mlx5_4", "worker_cpu": 24, "uvm_cpu": 25},
+        "5": {"nic": "mlx5_5", "worker_cpu": 26, "uvm_cpu": 27},
+        "6": {"nic": "mlx5_6", "worker_cpu": 28, "uvm_cpu": 29},
+        "7": {"nic": "mlx5_7", "worker_cpu": 30, "uvm_cpu": 31}
+      }
     }
   }'
 
-# D 节点
+# D 节点（TP=8，rank ↔ rank 一一对应；NIC 名按本机命名）
 vllm serve $MODEL \
   --kv-transfer-config '{
     "kv_connector": "PdConnector",
     "kv_connector_module_path": "pegaflow.pd_connector",
     "kv_role": "kv_consumer",
+    "engine_id": "decode",
     "kv_connector_extra_config": {
-      "oob_listen": "0.0.0.0:7100",
-      "rdma_devices": ["mlx5_0","mlx5_1"]
+      "pegaflow.pd.rdma.rank_map": { "0": {...}, ..., "7": {...} }
     }
   }'
 ```
+
+**schema**：
+- key 是 TP rank 的字符串（JSON 不允许 int key），`build_rdma_port` 用
+  `get_tensor_model_parallel_rank()` 取。
+- `nic`：单值字符串，每 rank 一张 HCA。NIC 可被多 rank 共享（启动时 warn），
+  CPU 必须互不相同。
+- `worker_cpu` / `uvm_cpu`：两个不同 CPU。worker 跑 CQ poll，uvm 跑 cuda 注册，
+  pin 同一个 CPU 会互抢。
+- `cuda_device` 不写，由 `kv_caches.device.index` 推断（vLLM 已经按 worker 进程
+  设好 `CUDA_VISIBLE_DEVICES`）。
+
+**校验规则**（启动时 fail-fast）：
+1. 当前 `tp_rank` 必须在 map 里，缺 key 直接报错（附带 `detect_topology()` 的探测
+   结果作为提示）。
+2. 所有 rank 的 `worker_cpu ∪ uvm_cpu` 必须互不相同。
+3. CPU 不允许在 `{0..15}`（默认 floor=16，给 OS 内核线程、vLLM 主线程、
+   torch worker 留出来）。`pegaflow.pd.rdma.reserved_cpu_floor` 可覆盖。
+4. `nic` 必须在 `ibv_get_device_list()` 里。
+5. NIC ↔ CPU 的 NUMA 不一致只 warn，不挡（跨 NUMA 也能跑，只是慢）。
+
+**砍掉的旧 config**：
+
+| 旧 key | 怎么处理 |
+| --- | --- |
+| `pegaflow.pd.rdma.cuda_device` | 砍，强制从 kv_caches 推 |
+| `pegaflow.pd.rdma.numa_node` | 砍，rank_map 隐含 |
+| `pegaflow.pd.rdma.domains` | 砍，rank_map 里 `nic` 替代 |
+| `pegaflow.pd.rdma.pin_worker_cpu` | 砍，rank_map 里 `worker_cpu` 替代 |
+| `pegaflow.pd.rdma.pin_uvm_cpu` | 砍，rank_map 里 `uvm_cpu` 替代 |
+| `pegaflow.pd.rdma.device` | 保留（cuda/host 切换） |
+| `pegaflow.pd.rdma.enabled` | 保留 |
+
+**PyO3 层签名不变**：Python `build_rdma_port` 把 `nic` 包成 `domains=[nic]` 传给
+`PdRdmaEngine`，scatter routing 在 num_domains=1 时自动退化为单 domain 直推。
+日后想再做 per-layer 多 NIC 分流不用改 Rust API。
+
+**为什么不靠自动 pin**：doc §3.4 实测，默认 pin (`group.cpus[0]/[1]`) 会撞上
+vLLM TP worker 主线程，h20 上 16 MiB 只跑 2.5 Gbps；显式 pin 避开后 24.7 Gbps。
+自动拓扑选 CPU 段没错（每 GPU 不重叠），错的是头部正好是 vLLM 也想 pin 的位置。
+让用户在 rank_map 里挑远离 0/1 的中段 CPU 是当前最稳的解法。
 
 ### 4.2 Hook 映射
 
@@ -737,7 +793,12 @@ PYTHONPATH=$PWD/python CUDA_VISIBLE_DEVICES=0 vllm serve /data/Qwen3-4B \
     "kv_connector": "PdConnector",
     "kv_connector_module_path": "pegaflow.pd_connector",
     "kv_role": "kv_producer",
-    "engine_id": "prefill"
+    "engine_id": "prefill",
+    "kv_connector_extra_config": {
+      "pegaflow.pd.rdma.rank_map": {
+        "0": {"nic": "mlx5_1", "worker_cpu": 60, "uvm_cpu": 62}
+      }
+    }
   }' \
   > /tmp/pegaflow-pd-logs/p.log 2>&1
 
@@ -747,7 +808,12 @@ PYTHONPATH=$PWD/python CUDA_VISIBLE_DEVICES=1 vllm serve /data/Qwen3-4B \
     "kv_connector": "PdConnector",
     "kv_connector_module_path": "pegaflow.pd_connector",
     "kv_role": "kv_consumer",
-    "engine_id": "decode"
+    "engine_id": "decode",
+    "kv_connector_extra_config": {
+      "pegaflow.pd.rdma.rank_map": {
+        "0": {"nic": "mlx5_1", "worker_cpu": 64, "uvm_cpu": 66}
+      }
+    }
   }' \
   > /tmp/pegaflow-pd-logs/d.log 2>&1
 

@@ -6,6 +6,7 @@ import json
 import queue
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -39,6 +40,7 @@ from pegaflow.pd_connector.oob import InMemoryOobPort
 from pegaflow.pd_connector.rdma import RdmaPort, build_rdma_port
 
 logger = get_connector_logger()
+_SLOT_MAPPING_CACHE_STEPS = 32
 
 
 class PdWorkerConnector:
@@ -73,10 +75,14 @@ class PdWorkerConnector:
         self._pending_worker_handshakes: dict[str, PdHandshake] = {}
         self._tracker = ChunkTracker()
         self._failed_blocks: set[int] = set()
+        self._completed_pushes: set[str] = set()
+        self._producer_finished_req_ids: set[str] = set()
         self._remote_block_offsets: dict[str, int] = {}
-        self._slot_mapping_block_cache: dict[tuple[Any, ...], set[int]] = {}
+        self._slot_mapping_block_cache: OrderedDict[tuple[Any, ...], set[int]] = OrderedDict()
+        self._forward_step_id = 0
         self._next_imm_id = 1
         self._push_sender = _AsyncLayerPushSender()
+        self._push_finalizer = _AsyncPushFinalizer(self._push_sender)
         self._rdma_waiter = _AsyncRdmaDoneWaiter(self.rdma) if self.rdma is not None else None
         self._prefill_sender = prefill_sender or _AsyncPrefillSender()
 
@@ -108,6 +114,7 @@ class PdWorkerConnector:
         forward_context: Any,
         **kwargs: Any,
     ) -> None:
+        self._forward_step_id += 1
         logger.debug(
             "[PdConnector] worker start_load_kv metadata=%s wait_reqs=%s push_reqs=%s release=%s known_wait=%s known_push=%s",
             metadata,
@@ -172,7 +179,6 @@ class PdWorkerConnector:
             self._push_reqs[req_id] = req
             self._pending_push_chunks.add(req_id)
             self._push_chunk_maps.pop(req_id, None)
-            self._slot_mapping_block_cache.clear()
             self.rdma.register_remote(req_id, handshake)
             logger.info(
                 "[PdConnector] P queued async push req=%s target_req=%s",
@@ -186,7 +192,6 @@ class PdWorkerConnector:
             self._push_reqs.pop(req_id, None)
             self._pending_push_chunks.discard(req_id)
             self._push_chunk_maps.pop(req_id, None)
-            self._slot_mapping_block_cache.clear()
             self._pending_worker_handshakes.pop(req_id, None)
             self._tracker.remove(req_id)
             close_request = getattr(self.rdma, "close_request", None)
@@ -242,10 +247,6 @@ class PdWorkerConnector:
             sorted(self._push_chunk_maps),
             sorted(self._tracker._requests),
         )
-        self._push_sender.wait_all()
-        for req_id in list(self._push_reqs):
-            self._rdma().wait_for_pushes(req_id)
-        self._slot_mapping_block_cache.clear()
         return None
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str] | None, set[str] | None]:
@@ -255,15 +256,17 @@ class PdWorkerConnector:
             sorted(self._wait_reqs),
             sorted(self._push_reqs),
         )
-        for req_id in list(self._wait_reqs):
-            self.rdma.poll_done(req_id)
+        self._producer_finished_req_ids.update(finished_req_ids)
         finished_sending = self.rdma.pop_finished_sending()
+        self._completed_pushes.update(finished_sending)
         finished_recving = self.rdma.pop_finished_recving()
-        for req_id in finished_sending:
+        releasable_sending = self._completed_pushes & self._producer_finished_req_ids
+        for req_id in releasable_sending:
+            self._completed_pushes.discard(req_id)
+            self._producer_finished_req_ids.discard(req_id)
             self._push_reqs.pop(req_id, None)
             self._pending_push_chunks.discard(req_id)
             self._push_chunk_maps.pop(req_id, None)
-            self._slot_mapping_block_cache.clear()
             self._tracker.remove(req_id)
             self._remote_block_offsets = {
                 key: value for key, value in self._remote_block_offsets.items() if key != req_id
@@ -275,12 +278,12 @@ class PdWorkerConnector:
                 close_request(req_id)
         logger.debug(
             "[PdConnector] worker get_finished exit sending=%s recving=%s remaining_wait=%s remaining_push=%s",
-            sorted(finished_sending),
+            sorted(releasable_sending),
             sorted(finished_recving),
             sorted(self._wait_reqs),
             sorted(self._push_reqs),
         )
-        return finished_sending or None, finished_recving or None
+        return releasable_sending or None, finished_recving or None
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         failed = self._failed_blocks
@@ -302,8 +305,12 @@ class PdWorkerConnector:
         self._push_reqs.clear()
         self._pending_push_chunks.clear()
         self._push_chunk_maps.clear()
+        self._slot_mapping_block_cache.clear()
+        self._completed_pushes.clear()
+        self._producer_finished_req_ids.clear()
         self._pending_worker_handshakes.clear()
         self._remote_block_offsets.clear()
+        self._push_finalizer.close()
         self._push_sender.close()
         if self._rdma_waiter is not None:
             self._rdma_waiter.close()
@@ -327,13 +334,18 @@ class PdWorkerConnector:
         block_size: int,
     ) -> set[int]:
         key = _slot_mapping_cache_key(slot_mapping, block_size)
+        key = (self._forward_step_id, *key)
         cached = self._slot_mapping_block_cache.get(key)
         if cached is not None:
+            self._slot_mapping_block_cache.move_to_end(key)
             return cached
         start = time.perf_counter()
         blocks = unique_blocks_from_slot_mapping(slot_mapping, block_size)
         elapsed_ms = (time.perf_counter() - start) * 1000
         self._slot_mapping_block_cache[key] = blocks
+        self._slot_mapping_block_cache.move_to_end(key)
+        while len(self._slot_mapping_block_cache) > _SLOT_MAPPING_CACHE_STEPS:
+            self._slot_mapping_block_cache.popitem(last=False)
         logger.info(
             "[PdConnector] P extracted slot_mapping blocks blocks=%d latency_ms=%.3f",
             len(blocks),
@@ -404,8 +416,6 @@ class PdWorkerConnector:
             self._tracker.mark_blocks_pushed(req_id, layer_idx, selected_blocks)
             if layer_idx != len(self.layer_names) - 1:
                 continue
-            self._push_sender.wait_all()
-            self.rdma.wait_for_pushes(req_id)
             self._pending_push_chunks.discard(req_id)
             self._push_chunk_maps.pop(req_id, None)
             chunk_complete = self._tracker.has_pushed_all_blocks(
@@ -422,10 +432,18 @@ class PdWorkerConnector:
                     len(selected_blocks),
                 )
                 continue
-            self.rdma.push_done(req_id)
             self._tracker.mark_done(req_id)
+            self._push_finalizer.submit(
+                _PushFinalizeTask(
+                    rdma=self.rdma,
+                    req_id=req_id,
+                    target_request_id=req.target_request_id,
+                    num_layers=len(self.layer_names),
+                    num_blocks=len(selected_blocks),
+                )
+            )
             logger.info(
-                "[PdConnector] P finished RDMA push req=%s target_req=%s layers=%d blocks=%d source=save_kv_layer",
+                "[PdConnector] P queued RDMA finalize req=%s target_req=%s layers=%d blocks=%d source=save_kv_layer",
                 req_id,
                 req.target_request_id,
                 len(self.layer_names),
@@ -561,11 +579,21 @@ class _LayerPushTask:
     block_slices: list[LayerBlockSlices]
 
 
+@dataclass(frozen=True)
+class _PushFinalizeTask:
+    rdma: RdmaPort
+    req_id: str
+    target_request_id: str
+    num_layers: int
+    num_blocks: int
+
+
 class _AsyncLayerPushSender:
     def __init__(self) -> None:
         self._queue: queue.Queue[_LayerPushTask | None] = queue.Queue()
         self._condition = threading.Condition()
         self._inflight = 0
+        self._inflight_by_req: dict[str, int] = {}
         self._error: BaseException | None = None
         self._thread = threading.Thread(target=self._run, name="pd-rdma-push-sender", daemon=True)
         self._thread.start()
@@ -575,11 +603,21 @@ class _AsyncLayerPushSender:
             if self._error is not None:
                 raise self._error
             self._inflight += 1
+            self._inflight_by_req[task.req_id] = self._inflight_by_req.get(task.req_id, 0) + 1
         self._queue.put(task)
 
     def wait_all(self) -> None:
         with self._condition:
             while self._inflight > 0 and self._error is None:
+                self._condition.wait()
+            if self._error is not None:
+                error = self._error
+                self._error = None
+                raise error
+
+    def wait_req(self, req_id: str) -> None:
+        with self._condition:
+            while self._inflight_by_req.get(req_id, 0) > 0 and self._error is None:
                 self._condition.wait()
             if self._error is not None:
                 error = self._error
@@ -604,6 +642,11 @@ class _AsyncLayerPushSender:
                 if task is not None:
                     with self._condition:
                         self._inflight -= 1
+                        remaining = self._inflight_by_req.get(task.req_id, 0) - 1
+                        if remaining > 0:
+                            self._inflight_by_req[task.req_id] = remaining
+                        else:
+                            self._inflight_by_req.pop(task.req_id, None)
                         self._condition.notify_all()
                 self._queue.task_done()
 
@@ -624,6 +667,73 @@ def _run_layer_push(task: _LayerPushTask) -> None:
         elapsed_s * 1000,
         bandwidth_gbps,
     )
+
+
+class _AsyncPushFinalizer:
+    def __init__(self, push_sender: _AsyncLayerPushSender) -> None:
+        self._push_sender = push_sender
+        self._queue: queue.Queue[_PushFinalizeTask | None] = queue.Queue()
+        self._condition = threading.Condition()
+        self._submitted: set[str] = set()
+        self._inflight = 0
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._run, name="pd-rdma-push-finalizer", daemon=True
+        )
+        self._thread.start()
+
+    def submit(self, task: _PushFinalizeTask) -> None:
+        with self._condition:
+            if self._error is not None:
+                raise self._error
+            if task.req_id in self._submitted:
+                return
+            self._submitted.add(task.req_id)
+            self._inflight += 1
+        self._queue.put(task)
+
+    def wait_all(self) -> None:
+        with self._condition:
+            while self._inflight > 0 and self._error is None:
+                self._condition.wait()
+            if self._error is not None:
+                error = self._error
+                self._error = None
+                raise error
+
+    def close(self) -> None:
+        self._queue.put(None)
+
+    def _run(self) -> None:
+        while True:
+            task = self._queue.get()
+            try:
+                if task is None:
+                    return
+                start = time.perf_counter()
+                self._push_sender.wait_req(task.req_id)
+                task.rdma.wait_for_pushes(task.req_id)
+                task.rdma.push_done(task.req_id)
+                elapsed_s = time.perf_counter() - start
+                logger.info(
+                    "[PdConnector] P finished RDMA push req=%s target_req=%s layers=%d blocks=%d finalize_ms=%.3f source=finalizer",
+                    task.req_id,
+                    task.target_request_id,
+                    task.num_layers,
+                    task.num_blocks,
+                    elapsed_s * 1000,
+                )
+            except BaseException as exc:
+                with self._condition:
+                    self._error = exc
+                    self._condition.notify_all()
+            finally:
+                if task is not None:
+                    with self._condition:
+                        self._submitted.discard(task.req_id)
+                        self._inflight -= 1
+                        self._condition.notify_all()
+                self._queue.task_done()
 
 
 class _AsyncRdmaDoneWaiter:

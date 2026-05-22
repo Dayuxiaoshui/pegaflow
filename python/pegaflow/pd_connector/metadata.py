@@ -115,14 +115,30 @@ class PrefillDispatch:
 
 
 def layer_layout_from_dict(data: dict[str, Any]) -> LayerRemoteLayout:
+    if data.get("block_addr_format") == "linear":
+        num_blocks = int(data["num_blocks"])
+        block_id_start = int(data["block_id_start"])
+        block_id_stride = int(data.get("block_id_stride", 1))
+        addr_stride = int(data["addr_stride"])
+        block_ids = tuple(block_id_start + idx * block_id_stride for idx in range(num_blocks))
+        k_block_addrs = tuple(
+            int(data["k_addr_start"]) + idx * addr_stride for idx in range(num_blocks)
+        )
+        v_block_addrs = tuple(
+            int(data["v_addr_start"]) + idx * addr_stride for idx in range(num_blocks)
+        )
+    else:
+        block_ids = tuple(int(block_id) for block_id in data["block_ids"])
+        k_block_addrs = tuple(int(addr) for addr in data["k_block_addrs"])
+        v_block_addrs = tuple(int(addr) for addr in data["v_block_addrs"])
     return LayerRemoteLayout(
         layer_name=str(data["layer_name"]),
         layer_idx=int(data["layer_idx"]),
         base_addr=int(data["base_addr"]),
         block_bytes=int(data["block_bytes"]),
-        block_ids=tuple(int(block_id) for block_id in data["block_ids"]),
-        k_block_addrs=tuple(int(addr) for addr in data["k_block_addrs"]),
-        v_block_addrs=tuple(int(addr) for addr in data["v_block_addrs"]),
+        block_ids=block_ids,
+        k_block_addrs=k_block_addrs,
+        v_block_addrs=v_block_addrs,
         mr_desc=data.get("mr_desc"),
     )
 
@@ -152,16 +168,54 @@ def handshakes_from_dicts(data: Any) -> tuple[PdHandshake, ...]:
 
 
 def layer_layout_to_dict(layer: LayerRemoteLayout) -> dict[str, Any]:
-    return {
+    common = {
         "layer_name": layer.layer_name,
         "layer_idx": layer.layer_idx,
         "base_addr": layer.base_addr,
         "block_bytes": layer.block_bytes,
+        "mr_desc": layer.mr_desc,
+    }
+    compact = _linear_layer_layout(layer)
+    if compact is not None:
+        return {**common, **compact}
+    return {
+        **common,
         "block_ids": list(layer.block_ids),
         "k_block_addrs": list(layer.k_block_addrs),
         "v_block_addrs": list(layer.v_block_addrs),
-        "mr_desc": layer.mr_desc,
     }
+
+
+def _linear_layer_layout(layer: LayerRemoteLayout) -> dict[str, Any] | None:
+    num_blocks = len(layer.block_ids)
+    if num_blocks == 0:
+        return None
+    if not (num_blocks == len(layer.k_block_addrs) == len(layer.v_block_addrs)):
+        return None
+    block_id_stride = _constant_stride(layer.block_ids)
+    k_stride = _constant_stride(layer.k_block_addrs)
+    v_stride = _constant_stride(layer.v_block_addrs)
+    if block_id_stride is None or k_stride is None or v_stride is None or k_stride != v_stride:
+        return None
+    return {
+        "block_addr_format": "linear",
+        "block_id_start": layer.block_ids[0],
+        "block_id_stride": block_id_stride,
+        "num_blocks": num_blocks,
+        "k_addr_start": layer.k_block_addrs[0],
+        "v_addr_start": layer.v_block_addrs[0],
+        "addr_stride": k_stride,
+    }
+
+
+def _constant_stride(values: tuple[int, ...]) -> int | None:
+    if len(values) <= 1:
+        return 1
+    stride = values[1] - values[0]
+    for prev, current in zip(values[:-1], values[1:], strict=True):
+        if current - prev != stride:
+            return None
+    return stride
 
 
 def handshake_to_dict(handshake: PdHandshake | None) -> dict[str, Any] | None:

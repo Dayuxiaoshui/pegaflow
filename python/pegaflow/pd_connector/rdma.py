@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from pegaflow.logging_utils import get_connector_logger
@@ -265,26 +266,25 @@ def build_rdma_port(vllm_config: Any, cuda_device: int | None) -> RdmaPort:
     except AttributeError as exc:
         raise RuntimeError("pegaflow.pegaflow does not expose PdRdmaEngine") from exc
 
+    _reject_legacy_rank_config(config)
     device = _extra(config, "pegaflow.pd.rdma.device", "cuda")
-    configured_cuda_device = _extra(config, "pegaflow.pd.rdma.cuda_device", None)
-    numa_node = _extra(config, "pegaflow.pd.rdma.numa_node", None)
-    domains = _normalize_domains(_extra(config, "pegaflow.pd.rdma.domains", None))
-    pin_worker_cpu = _extra(config, "pegaflow.pd.rdma.pin_worker_cpu", None)
-    pin_uvm_cpu = _extra(config, "pegaflow.pd.rdma.pin_uvm_cpu", None)
-    resolved_cuda_device = int(
-        configured_cuda_device if configured_cuda_device is not None else cuda_device or 0
-    )
+    rank_config = _rank_rdma_config(config, _tp_rank(vllm_config))
+    resolved_cuda_device = int(cuda_device or 0)
     engine = PdRdmaEngine(
         cuda_device=resolved_cuda_device,
-        numa_node=_optional_int(numa_node),
-        domains=domains,
+        numa_node=None,
+        domains=[rank_config.nic],
         device=str(device),
-        pin_worker_cpu=_optional_int(pin_worker_cpu),
-        pin_uvm_cpu=_optional_int(pin_uvm_cpu),
+        pin_worker_cpu=rank_config.worker_cpu,
+        pin_uvm_cpu=rank_config.uvm_cpu,
     )
     logger.info(
-        "[PdConnector] native RDMA enabled cuda=%d domains=%d groups=%d link_speed=%s",
+        "[PdConnector] native RDMA enabled tp_rank=%d cuda=%d nic=%s worker_cpu=%d uvm_cpu=%d domains=%d groups=%d link_speed=%s",
+        rank_config.tp_rank,
         resolved_cuda_device,
+        rank_config.nic,
+        rank_config.worker_cpu,
+        rank_config.uvm_cpu,
         engine.num_domains(),
         engine.num_groups(),
         engine.aggregated_link_speed(),
@@ -320,9 +320,96 @@ def _optional_int(value: Any) -> int | None:
     return int(value)
 
 
-def _normalize_domains(value: Any) -> list[str] | None:
+@dataclass(frozen=True)
+class _RankRdmaConfig:
+    tp_rank: int
+    nic: str
+    worker_cpu: int
+    uvm_cpu: int
+
+
+def _tp_rank(vllm_config: Any) -> int:
+    parallel_config = getattr(vllm_config, "parallel_config", None)
+    return int(getattr(parallel_config, "tensor_parallel_rank", 0) or 0)
+
+
+def _reject_legacy_rank_config(config: Any) -> None:
+    legacy_keys = (
+        "pegaflow.pd.rdma.cuda_device",
+        "pegaflow.pd.rdma.numa_node",
+        "pegaflow.pd.rdma.domains",
+        "pegaflow.pd.rdma.pin_worker_cpu",
+        "pegaflow.pd.rdma.pin_uvm_cpu",
+    )
+    present = [key for key in legacy_keys if _extra(config, key, _MISSING) is not _MISSING]
+    if present:
+        raise RuntimeError(
+            "PdConnector RDMA requires pegaflow.pd.rdma.rank_map; remove legacy keys: "
+            + ", ".join(present)
+        )
+
+
+def _rank_rdma_config(config: Any, tp_rank: int) -> _RankRdmaConfig:
+    rank_map = _extra(config, "pegaflow.pd.rdma.rank_map", _MISSING)
+    if not isinstance(rank_map, dict):
+        raise RuntimeError("PdConnector RDMA requires pegaflow.pd.rdma.rank_map")
+    _validate_rank_map_cpus(config, rank_map)
+    rank_entry = rank_map.get(str(tp_rank))
+    if not isinstance(rank_entry, dict):
+        known = ", ".join(sorted(str(rank) for rank in rank_map))
+        raise RuntimeError(
+            f"PdConnector RDMA rank_map missing tp_rank={tp_rank}; configured ranks=[{known}]"
+        )
+    nic = str(rank_entry.get("nic") or "")
+    if not nic:
+        raise RuntimeError(f"PdConnector RDMA rank_map[{tp_rank}] missing nic")
+    worker_cpu = _required_rank_cpu(rank_entry, tp_rank, "worker_cpu")
+    uvm_cpu = _required_rank_cpu(rank_entry, tp_rank, "uvm_cpu")
+    if worker_cpu == uvm_cpu:
+        raise RuntimeError(
+            f"PdConnector RDMA rank_map[{tp_rank}] worker_cpu and uvm_cpu must differ"
+        )
+    return _RankRdmaConfig(
+        tp_rank=tp_rank,
+        nic=nic,
+        worker_cpu=worker_cpu,
+        uvm_cpu=uvm_cpu,
+    )
+
+
+def _validate_rank_map_cpus(config: Any, rank_map: dict[Any, Any]) -> None:
+    reserved_floor = int(_extra(config, "pegaflow.pd.rdma.reserved_cpu_floor", 16))
+    seen: dict[int, str] = {}
+    nics: dict[str, list[str]] = {}
+    for rank, entry in rank_map.items():
+        if not isinstance(entry, dict):
+            raise RuntimeError(f"PdConnector RDMA rank_map[{rank}] must be an object")
+        nic = str(entry.get("nic") or "")
+        if nic:
+            nics.setdefault(nic, []).append(str(rank))
+        for field in ("worker_cpu", "uvm_cpu"):
+            cpu = _required_rank_cpu(entry, rank, field)
+            if cpu < reserved_floor:
+                raise RuntimeError(
+                    f"PdConnector RDMA rank_map[{rank}] {field}={cpu} is below reserved_cpu_floor={reserved_floor}"
+                )
+            owner = seen.get(cpu)
+            if owner is not None:
+                raise RuntimeError(
+                    f"PdConnector RDMA rank_map CPU {cpu} is reused by {owner} and rank {rank} {field}"
+                )
+            seen[cpu] = f"rank {rank} {field}"
+    for nic, ranks in sorted(nics.items()):
+        if len(ranks) > 1:
+            logger.warning(
+                "[PdConnector] RDMA rank_map shares nic=%s across ranks=%s",
+                nic,
+                ranks,
+            )
+
+
+def _required_rank_cpu(entry: dict[Any, Any], rank: object, field: str) -> int:
+    value = entry.get(field)
     if value is None or value == "":
-        return None
-    if isinstance(value, str):
-        return [item.strip() for item in value.split(",") if item.strip()]
-    return [str(item) for item in value]
+        raise RuntimeError(f"PdConnector RDMA rank_map[{rank}] missing {field}")
+    return int(value)
