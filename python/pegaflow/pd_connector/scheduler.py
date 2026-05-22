@@ -18,6 +18,7 @@ from pegaflow.pd_connector.metadata import (
     handshakes_from_dicts,
     normalize_block_ids,
 )
+from pegaflow.pd_connector.prefill import AsyncPrefillSender, prefill_task_from_dispatch
 
 logger = get_connector_logger()
 
@@ -42,7 +43,7 @@ def _prompt_token_ids(request: Any) -> tuple[int, ...]:
 
 
 class PdSchedulerConnector:
-    def __init__(self, vllm_config: Any) -> None:
+    def __init__(self, vllm_config: Any, prefill_sender: Any | None = None) -> None:
         self.vllm_config = vllm_config
         self.engine_id = getattr(vllm_config.kv_transfer_config, "engine_id", None) or ""
         self._reqs_to_wait: dict[str, WaitReqMeta] = {}
@@ -58,6 +59,7 @@ class PdSchedulerConnector:
         self._active_push_meta: dict[str, PushReqMeta] = {}
         self._wait_alloc_ts_ns: dict[str, int] = {}
         self._wait_finished_ts_ns: dict[str, int] = {}
+        self._prefill_sender = prefill_sender or AsyncPrefillSender()
 
     def get_num_new_matched_tokens(
         self,
@@ -316,7 +318,7 @@ class PdSchedulerConnector:
             if req_id in self._prefill_dispatches or req_id in self._dispatched_prefills:
                 continue
             handshakes = tuple(merged[rank] for rank in sorted(merged))
-            self._prefill_dispatches[req_id] = PrefillDispatch(
+            dispatch = PrefillDispatch(
                 request_id=wait_req.remote_request_id,
                 prefill_url=wait_req.prefill_url,
                 model=wait_req.model,
@@ -327,16 +329,22 @@ class PdSchedulerConnector:
                 handshakes=handshakes,
             )
             self._dispatched_prefills.add(req_id)
+            self._prefill_sender.submit(prefill_task_from_dispatch(dispatch))
             alloc_ts_ns = self._wait_alloc_ts_ns.get(req_id)
             dispatch_ms = _elapsed_ms(alloc_ts_ns, now_ns)
             logger.info(
-                "[PdConnector] scheduler queued prefill dispatch req=%s remote_req=%s ranks=%s dispatch_ms=%s ts_ns=%d",
+                "[PdConnector] scheduler submitted prefill dispatch req=%s remote_req=%s ranks=%s dispatch_ms=%s ts_ns=%d",
                 req_id,
                 wait_req.remote_request_id,
                 [handshake.tp_rank for handshake in handshakes],
                 _fmt_ms(dispatch_ms),
                 now_ns,
             )
+
+    def shutdown(self) -> None:
+        close = getattr(self._prefill_sender, "close", None)
+        if close is not None:
+            close()
 
 
 def _count(block_ids: tuple[list[int], ...]) -> int:

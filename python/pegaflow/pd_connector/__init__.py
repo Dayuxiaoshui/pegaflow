@@ -85,6 +85,8 @@ class PdConnector(KVConnectorBase_V1, SupportsHMA):
     def shutdown(self) -> None:
         if self._worker is not None:
             self._worker.shutdown()
+        if self._scheduler is not None:
+            self._scheduler.shutdown()
 
     def get_num_new_matched_tokens(
         self,

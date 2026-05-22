@@ -961,13 +961,15 @@ def test_d_worker_reports_handshake_after_alloc() -> None:
     assert handshake.layers[0].block_ids == (1,)
 
 
-def test_scheduler_fans_in_handshakes_before_prefill_dispatch() -> None:
+def test_scheduler_fans_in_handshakes_and_submits_prefill_immediately() -> None:
     tensor = FakeTensor(
         shape=(2, 8, 16, 4, 32),
         stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
     )
+    prefill_sender = FakePrefillSender()
     scheduler = PdSchedulerConnector(
-        SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="decode"))
+        SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="decode")),
+        prefill_sender=prefill_sender,
     )
     request = SimpleNamespace(
         request_id="internal-d",
@@ -1012,6 +1014,7 @@ def test_scheduler_fans_in_handshakes_before_prefill_dispatch() -> None:
     )
     partial_dispatch_meta = scheduler.build_connector_meta(SimpleNamespace())
     assert partial_dispatch_meta.prefill_dispatches == {}
+    assert prefill_sender.tasks == []
 
     scheduler.update_connector_output(
         SimpleNamespace(
@@ -1024,10 +1027,15 @@ def test_scheduler_fans_in_handshakes_before_prefill_dispatch() -> None:
     )
     dispatch_meta = scheduler.build_connector_meta(SimpleNamespace())
 
-    dispatch = dispatch_meta.prefill_dispatches["internal-d"]
-    assert dispatch.request_id == "external-p"
-    assert dispatch.target_request_id == "external-d"
-    assert [handshake.tp_rank for handshake in dispatch.handshakes] == [0, 1]
+    assert dispatch_meta.prefill_dispatches == {}
+    assert len(prefill_sender.tasks) == 1
+    task = prefill_sender.tasks[0]
+    assert task.request_id == "external-p"
+    assert task.kv_transfer_params["target_request_id"] == "external-d"
+    assert [handshake["tp_rank"] for handshake in task.kv_transfer_params["pd_handshakes"]] == [
+        0,
+        1,
+    ]
 
 
 def test_p_worker_selects_matching_tp_rank_handshake() -> None:

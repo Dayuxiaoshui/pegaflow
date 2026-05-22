@@ -2,15 +2,12 @@
 
 from __future__ import annotations
 
-import json
 import queue
 import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
@@ -31,13 +28,16 @@ from pegaflow.pd_connector.metadata import (
     PdHandshake,
     PdPrefillRequest,
     PdWorkerMetadata,
-    PrefillDispatch,
     PushReqMeta,
     WaitReqMeta,
     flatten_block_ids,
-    handshake_to_dict,
 )
 from pegaflow.pd_connector.oob import InMemoryOobPort
+from pegaflow.pd_connector.prefill import (
+    AsyncPrefillSender,
+    prefill_task_from_dispatch,
+    producer_params,
+)
 from pegaflow.pd_connector.rdma import RdmaPort, build_rdma_port
 
 logger = get_connector_logger()
@@ -79,13 +79,14 @@ class PdWorkerConnector:
         self._completed_pushes: set[str] = set()
         self._producer_finished_req_ids: set[str] = set()
         self._remote_block_offsets: dict[str, int] = {}
+        self._push_traces: dict[str, _PushTrace] = {}
         self._slot_mapping_block_cache: OrderedDict[tuple[Any, ...], set[int]] = OrderedDict()
         self._forward_step_id = 0
         self._next_imm_id = 1
         self._push_sender = _AsyncLayerPushSender()
         self._push_finalizer = _AsyncPushFinalizer(self._push_sender)
         self._rdma_waiter = _AsyncRdmaDoneWaiter(self.rdma) if self.rdma is not None else None
-        self._prefill_sender = prefill_sender or _AsyncPrefillSender()
+        self._prefill_sender = prefill_sender or AsyncPrefillSender()
 
     def register_kv_caches(self, kv_caches: dict[str, Any]) -> None:
         self.layouts = {
@@ -144,7 +145,7 @@ class PdWorkerConnector:
                 PdPrefillRequest(
                     request_id=req.remote_request_id,
                     prompt_token_ids=req.prompt_token_ids,
-                    producer_kv_transfer_params=_producer_params(
+                    producer_kv_transfer_params=producer_params(
                         target_engine_id=self.engine_id,
                         target_request_id=req.done_request_id,
                         handshake=handshake,
@@ -166,7 +167,7 @@ class PdWorkerConnector:
         for req_id, dispatch in metadata.prefill_dispatches.items():
             if self.tp_rank != 0:
                 continue
-            self._prefill_sender.submit(_prefill_task_from_dispatch(dispatch))
+            self._prefill_sender.submit(prefill_task_from_dispatch(dispatch))
             logger.info(
                 "[PdConnector] D rank0 submitted prefill dispatch req=%s remote_req=%s ranks=%s",
                 req_id,
@@ -182,6 +183,8 @@ class PdWorkerConnector:
                 handshake = prefill_request.handshake
                 req = replace(req, handshake=handshake)
             self._push_reqs[req_id] = req
+            trace = self._push_traces.setdefault(req_id, _PushTrace(queued_ts_ns=time.time_ns()))
+            trace.chunk_queued_ts_ns = time.time_ns()
             self._pending_push_chunks.add(req_id)
             self._push_chunk_maps.pop(req_id, None)
             self.rdma.register_remote(req_id, handshake)
@@ -198,6 +201,7 @@ class PdWorkerConnector:
             self._pending_push_chunks.discard(req_id)
             self._push_chunk_maps.pop(req_id, None)
             self._pending_worker_handshakes.pop(req_id, None)
+            self._push_traces.pop(req_id, None)
             self._tracker.remove(req_id)
             close_request = getattr(self.rdma, "close_request", None)
             if close_request is not None:
@@ -272,6 +276,7 @@ class PdWorkerConnector:
             self._push_reqs.pop(req_id, None)
             self._pending_push_chunks.discard(req_id)
             self._push_chunk_maps.pop(req_id, None)
+            self._push_traces.pop(req_id, None)
             self._tracker.remove(req_id)
             self._remote_block_offsets = {
                 key: value for key, value in self._remote_block_offsets.items() if key != req_id
@@ -315,6 +320,7 @@ class PdWorkerConnector:
         self._producer_finished_req_ids.clear()
         self._pending_worker_handshakes.clear()
         self._remote_block_offsets.clear()
+        self._push_traces.clear()
         self._push_finalizer.close()
         self._push_sender.close()
         if self._rdma_waiter is not None:
@@ -396,7 +402,28 @@ class PdWorkerConnector:
             selected_blocks = req_blocks & touched_blocks
             if not selected_blocks:
                 continue
+            trace = self._push_traces.setdefault(
+                req_id,
+                _PushTrace(queued_ts_ns=time.time_ns()),
+            )
+            save_ts_ns = time.time_ns()
+            if trace.first_save_ts_ns is None:
+                trace.first_save_ts_ns = save_ts_ns
+            if trace.chunk_first_save_ts_ns is None:
+                trace.chunk_first_save_ts_ns = save_ts_ns
+                logger.info(
+                    "[PdConnector] P first save_kv_layer chunk req=%s target_req=%s chunk=%d layer=%d blocks=%d schedule_to_chunk_first_save_ms=%.3f schedule_to_request_first_save_ms=%.3f ts_ns=%d",
+                    req_id,
+                    req.target_request_id,
+                    trace.chunk_count + 1,
+                    layer_idx,
+                    len(selected_blocks),
+                    _elapsed_ms(trace.chunk_queued_ts_ns, save_ts_ns),
+                    _elapsed_ms(trace.queued_ts_ns, trace.first_save_ts_ns),
+                    save_ts_ns,
+                )
             remote_block_ids, all_chunks_seen = self._push_chunk_maps.get(req_id, ({}, False))
+            submit_start_ns = time.perf_counter_ns()
             if not remote_block_ids:
                 remote_block_ids, all_chunks_seen = self._remote_block_id_map(
                     req_id,
@@ -421,9 +448,16 @@ class PdWorkerConnector:
                 block_slices,
                 num_blocks=len(selected_blocks),
             )
+            submit_ns = time.perf_counter_ns() - submit_start_ns
+            trace.kv_submit_ns += submit_ns
+            trace.chunk_kv_submit_ns += submit_ns
+            trace.layer_submit_count += 1
+            trace.chunk_layer_submit_count += 1
             self._tracker.mark_blocks_pushed(req_id, layer_idx, selected_blocks)
             if layer_idx != len(self.layer_names) - 1:
                 continue
+            trace.chunk_count += 1
+            trace.last_save_ts_ns = time.time_ns()
             self._pending_push_chunks.discard(req_id)
             self._push_chunk_maps.pop(req_id, None)
             chunk_complete = self._tracker.has_pushed_all_blocks(
@@ -433,14 +467,41 @@ class PdWorkerConnector:
             )
             if not (chunk_complete and all_chunks_seen):
                 logger.info(
-                    "[PdConnector] P pushed RDMA chunk req=%s target_req=%s layers=%d blocks=%d",
+                    "[PdConnector] P observed prefill chunk req=%s target_req=%s chunk=%d layers=%d blocks=%d all_chunks_seen=%s chunk_forward_ms=%.3f request_forward_ms=%.3f chunk_kv_submit_ms=%.3f request_kv_submit_ms=%.3f chunk_layer_submits=%d request_layer_submits=%d ts_ns=%d",
                     req_id,
                     req.target_request_id,
+                    trace.chunk_count,
                     len(self.layer_names),
                     len(selected_blocks),
+                    all_chunks_seen,
+                    _elapsed_ms(trace.chunk_first_save_ts_ns, trace.last_save_ts_ns),
+                    _elapsed_ms(trace.first_save_ts_ns, trace.last_save_ts_ns),
+                    trace.chunk_kv_submit_ns / 1_000_000,
+                    trace.kv_submit_ns / 1_000_000,
+                    trace.chunk_layer_submit_count,
+                    trace.layer_submit_count,
+                    trace.last_save_ts_ns,
                 )
+                trace.reset_chunk()
                 continue
             self._tracker.mark_done(req_id)
+            finalize_ts_ns = time.time_ns()
+            logger.info(
+                "[PdConnector] P observed prefill final chunk req=%s target_req=%s chunks=%d layers=%d blocks=%d schedule_to_last_save_ms=%.3f chunk_forward_ms=%.3f request_forward_ms=%.3f chunk_kv_submit_ms=%.3f request_kv_submit_ms=%.3f chunk_layer_submits=%d request_layer_submits=%d ts_ns=%d",
+                req_id,
+                req.target_request_id,
+                trace.chunk_count,
+                len(self.layer_names),
+                len(selected_blocks),
+                (finalize_ts_ns - trace.queued_ts_ns) / 1_000_000,
+                _elapsed_ms(trace.chunk_first_save_ts_ns, trace.last_save_ts_ns),
+                _elapsed_ms(trace.first_save_ts_ns, trace.last_save_ts_ns),
+                trace.chunk_kv_submit_ns / 1_000_000,
+                trace.kv_submit_ns / 1_000_000,
+                trace.chunk_layer_submit_count,
+                trace.layer_submit_count,
+                finalize_ts_ns,
+            )
             self._push_finalizer.submit(
                 _PushFinalizeTask(
                     rdma=self.rdma,
@@ -448,6 +509,12 @@ class PdWorkerConnector:
                     target_request_id=req.target_request_id,
                     num_layers=len(self.layer_names),
                     num_blocks=len(selected_blocks),
+                    chunk_count=trace.chunk_count,
+                    first_save_ts_ns=trace.first_save_ts_ns,
+                    last_save_ts_ns=trace.last_save_ts_ns,
+                    finalize_queued_ts_ns=finalize_ts_ns,
+                    kv_submit_ns=trace.kv_submit_ns,
+                    layer_submit_count=trace.layer_submit_count,
                 )
             )
             logger.info(
@@ -650,6 +717,12 @@ def _slot_mapping_cache_key(slot_mapping: Any, block_size: int) -> tuple[Any, ..
     return ("object", id(slot_mapping), block_size)
 
 
+def _elapsed_ms(start_ts_ns: int | None, end_ts_ns: int | None) -> float:
+    if start_ts_ns is None or end_ts_ns is None:
+        return 0.0
+    return (end_ts_ns - start_ts_ns) / 1_000_000
+
+
 @dataclass(frozen=True)
 class _LayerPushTask:
     rdma: RdmaPort
@@ -660,6 +733,26 @@ class _LayerPushTask:
     num_blocks: int
 
 
+@dataclass
+class _PushTrace:
+    queued_ts_ns: int
+    chunk_queued_ts_ns: int | None = None
+    first_save_ts_ns: int | None = None
+    chunk_first_save_ts_ns: int | None = None
+    last_save_ts_ns: int | None = None
+    kv_submit_ns: int = 0
+    chunk_kv_submit_ns: int = 0
+    layer_submit_count: int = 0
+    chunk_layer_submit_count: int = 0
+    chunk_count: int = 0
+
+    def reset_chunk(self) -> None:
+        self.chunk_queued_ts_ns = None
+        self.chunk_first_save_ts_ns = None
+        self.chunk_kv_submit_ns = 0
+        self.chunk_layer_submit_count = 0
+
+
 @dataclass(frozen=True)
 class _PushFinalizeTask:
     rdma: RdmaPort
@@ -667,6 +760,12 @@ class _PushFinalizeTask:
     target_request_id: str
     num_layers: int
     num_blocks: int
+    chunk_count: int
+    first_save_ts_ns: int | None
+    last_save_ts_ns: int | None
+    finalize_queued_ts_ns: int
+    kv_submit_ns: int
+    layer_submit_count: int
 
 
 class _AsyncLayerPushSender:
@@ -796,14 +895,23 @@ class _AsyncPushFinalizer:
                 self._push_sender.wait_req(task.req_id)
                 task.rdma.wait_for_pushes(task.req_id)
                 task.rdma.push_done(task.req_id)
+                done_ts_ns = time.time_ns()
                 elapsed_s = time.perf_counter() - start
                 logger.info(
-                    "[PdConnector] P finished RDMA push req=%s target_req=%s layers=%d blocks=%d finalize_ms=%.3f source=finalizer",
+                    "[PdConnector] P finished RDMA push req=%s target_req=%s chunks=%d layers=%d blocks=%d finalize_ms=%.3f finalize_queued_to_imm_ms=%.3f observed_forward_ms=%.3f kv_submit_ms=%.3f last_save_to_imm_ms=%.3f first_save_to_imm_ms=%.3f layer_submits=%d source=finalizer ts_ns=%d",
                     task.req_id,
                     task.target_request_id,
+                    task.chunk_count,
                     task.num_layers,
                     task.num_blocks,
                     elapsed_s * 1000,
+                    _elapsed_ms(task.finalize_queued_ts_ns, done_ts_ns),
+                    _elapsed_ms(task.first_save_ts_ns, task.last_save_ts_ns),
+                    task.kv_submit_ns / 1_000_000,
+                    _elapsed_ms(task.last_save_ts_ns, done_ts_ns),
+                    _elapsed_ms(task.first_save_ts_ns, done_ts_ns),
+                    task.layer_submit_count,
+                    done_ts_ns,
                 )
             except BaseException as exc:
                 with self._condition:
@@ -852,126 +960,6 @@ class _AsyncRdmaDoneWaiter:
                 )
             except Exception:
                 logger.exception("[PdConnector] D RDMA done wait failed req=%s", req_id)
-
-
-@dataclass(frozen=True)
-class _PrefillHttpTask:
-    request_id: str
-    prefill_url: str
-    model: str
-    prompt_token_ids: tuple[int, ...]
-    max_tokens: int
-    kv_transfer_params: dict[str, Any]
-
-
-class _AsyncPrefillSender:
-    def __init__(self) -> None:
-        self._queue: queue.Queue[_PrefillHttpTask | None] = queue.Queue()
-        self._thread = threading.Thread(target=self._run, name="pd-prefill-sender", daemon=True)
-        self._thread.start()
-
-    def submit(self, task: _PrefillHttpTask) -> None:
-        self._queue.put(task)
-
-    def close(self) -> None:
-        self._queue.put(None)
-
-    def _run(self) -> None:
-        while True:
-            task = self._queue.get()
-            try:
-                if task is None:
-                    return
-                _post_prefill_request(task)
-            finally:
-                self._queue.task_done()
-
-
-def _post_prefill_request(task: _PrefillHttpTask) -> None:
-    url = task.prefill_url.rstrip("/") + "/v1/completions"
-    start_ts_ns = time.time_ns()
-    body = {
-        "model": task.model,
-        "prompt": list(task.prompt_token_ids),
-        "max_tokens": task.max_tokens,
-        "temperature": 0,
-        "stream": False,
-        "request_id": task.request_id,
-        "kv_transfer_params": task.kv_transfer_params,
-    }
-    payload = json.dumps(body).encode()
-    logger.info(
-        "[PdConnector] D -> P prefill request req=%s url=%s tokens=%d payload_bytes=%d target_req=%s ts_ns=%d",
-        task.request_id,
-        url,
-        len(task.prompt_token_ids),
-        len(payload),
-        task.kv_transfer_params.get("target_request_id"),
-        start_ts_ns,
-    )
-    request = Request(
-        url,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urlopen(request, timeout=600) as response:
-            response_body = response.read()
-            end_ts_ns = time.time_ns()
-            logger.info(
-                "[PdConnector] D -> P prefill completed req=%s status=%s bytes=%d latency_ms=%.3f ts_ns=%d",
-                task.request_id,
-                response.status,
-                len(response_body),
-                (end_ts_ns - start_ts_ns) / 1_000_000,
-                end_ts_ns,
-            )
-    except HTTPError as exc:
-        response_body = exc.read()
-        logger.error(
-            "[PdConnector] D -> P prefill failed req=%s status=%s body=%s",
-            task.request_id,
-            exc.code,
-            response_body[:512],
-        )
-    except URLError:
-        logger.exception(
-            "[PdConnector] D -> P prefill connection failed req=%s url=%s",
-            task.request_id,
-            url,
-        )
-
-
-def _prefill_task_from_dispatch(dispatch: PrefillDispatch) -> _PrefillHttpTask:
-    params = _producer_params(
-        dispatch.target_engine_id,
-        dispatch.target_request_id,
-    )
-    params["pd_handshakes"] = [handshake_to_dict(handshake) for handshake in dispatch.handshakes]
-    return _PrefillHttpTask(
-        request_id=dispatch.request_id,
-        prefill_url=dispatch.prefill_url,
-        model=dispatch.model,
-        prompt_token_ids=dispatch.prompt_token_ids,
-        max_tokens=dispatch.max_tokens,
-        kv_transfer_params=params,
-    )
-
-
-def _producer_params(
-    target_engine_id: str,
-    target_request_id: str,
-    handshake: PdHandshake | None = None,
-) -> dict[str, Any]:
-    params: dict[str, Any] = {
-        "do_remote_prefill_sender": True,
-        "target_engine_id": target_engine_id,
-        "target_request_id": target_request_id,
-    }
-    if handshake is not None:
-        params["pd_handshake"] = handshake_to_dict(handshake)
-    return params
 
 
 def _infer_cuda_device(kv_caches: dict[str, Any]) -> int | None:

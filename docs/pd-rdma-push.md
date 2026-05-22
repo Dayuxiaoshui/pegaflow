@@ -888,11 +888,17 @@ cache off 的阶段性结果：
 | PD push，未合并 WR | 2538.1 ms | 每层大量 4 KiB WR，Python/RDMA submit 成本主导 |
 | PD push，native range coalesce | 2046.5 ms | native 侧合并连续 block range |
 | PD push，worker 直接生成 range | 1475.4 ms | 30k 最后一段每层每 rank `blocks=339 ranges=1` |
+| PD push，scheduler 直接触发 P prefill | 1373.0 ms | 去掉 scheduler→rank0 worker 派发等待；D fan-in 仍约 149 ms |
 
 当前 RDMA 写本身已不再是主瓶颈：P 端单层每 rank 2.7-4.2 MiB range WRITE 通常
 0.03-0.10 ms，日志带宽多在数百 Gbps 量级。剩余差距主要在 P/D 调度、chunked
 prefill 多 step、D 聚合 handshake 后触发 P prefill 的控制面延迟，以及长上下文
-slot_mapping/JSON 路径。
+slot_mapping/JSON 路径。当前 P 端日志会把每个 chunk 的 `first save_kv_layer`、
+chunk/request forward span、chunk/request KV submit 累计耗时、finalizer drain/IMM 耗时
+拆开打印；D 端日志会打印 scheduler wait、handshake fan-in dispatch、D→P HTTP payload
+和 IMM done 时间戳。`trace-30k-trace2` 中 D 端 handshake fan-in 约 148.7 ms，D scheduler
+提交 dispatch 到真正发起 D→P HTTP 还有约 58.4 ms；P 端 4 个 chunk 的 layer-wise RDMA
+submit 每 chunk 约 3 ms，最后一段从最后一层 save 到 IMM 约 2.3-2.5 ms。
 MLA layout 仍未支持：Kimi 等模型的 KV cache 不是当前的 FlashAttention 5D HND layout，
 现在会被 connector assert 拦下。后续要把 MLA 作为一等 layout 接入，而不是依赖 HND fallback。
 
@@ -915,10 +921,12 @@ MLA layout 仍未支持：Kimi 等模型的 KV cache 不是当前的 FlashAttent
    解析、block 地址表生成、per-layer push/wait 覆盖逻辑和契约测试。压测阶段先用 HND 模型
    跑通链路，MLA 作为 P/D connector 的正式 TODO 继续推进。
 10. **TP8 handshake fan-in**：已从 "每个 D worker 都向 P 发一次 prefill HTTP" 改为
-    D scheduler fan-in 所有 rank 的 handshake，再由 D rank0 向 P 发一次 prefill。
+    D scheduler fan-in 所有 rank 的 handshake，并在收齐 handshake 的同一次
+    `update_connector_output` 里直接异步触发 P prefill。
     P worker 按自身 `tp_rank` 选择同 rank 的 handshake，避免 N×N producer request，
-    也避免 IMM 落到错误 D rank 的 counter。后续要继续压 fan-in/JSON/HTTP 成本，
-    并补更大模型的实测。
+    也避免 IMM 落到错误 D rank 的 counter。旧的 "scheduler → D rank0 worker →
+    HTTP thread" 派发路径保留为兼容入口，但生产路径不再等下一轮 worker metadata。
+    后续要继续压 fan-in/JSON/HTTP 成本，并补更大模型的实测。
 11. **slot_mapping cache 与完成轮询**：D 侧 `get_finished` 不再对 `_wait_reqs` 跑
     `poll_done` for-loop，IMM 完成由后台 waiter 写入 `finished_recving`；P 侧
     `slot_mapping` block 提取按 `forward_step_id + tensor identity` 做 LRU cache，
