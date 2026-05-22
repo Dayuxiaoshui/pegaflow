@@ -7,8 +7,7 @@ from dataclasses import dataclass, field
 
 @dataclass
 class RequestChunks:
-    pushed_layers: set[int] = field(default_factory=set)
-    pushed_blocks: set[int] = field(default_factory=set)
+    pushed_pairs: set[tuple[int, int]] = field(default_factory=set)
     done: bool = False
 
 
@@ -19,17 +18,26 @@ class ChunkTracker:
     def add_request(self, req_id: str) -> None:
         self._requests.setdefault(req_id, RequestChunks())
 
-    def mark_layer_pushed(self, req_id: str, layer_idx: int) -> None:
+    def mark_blocks_pushed(self, req_id: str, layer_idx: int, block_ids: set[int]) -> None:
         self.add_request(req_id)
-        self._requests[req_id].pushed_layers.add(layer_idx)
+        self._requests[req_id].pushed_pairs.update((layer_idx, block_id) for block_id in block_ids)
 
-    def mark_blocks_pushed(self, req_id: str, block_ids: set[int]) -> None:
+    def has_pushed_all_blocks(
+        self,
+        req_id: str,
+        block_ids: set[int],
+        *,
+        num_layers: int,
+    ) -> bool:
         self.add_request(req_id)
-        self._requests[req_id].pushed_blocks.update(block_ids)
+        expected = {
+            (layer_idx, block_id) for layer_idx in range(num_layers) for block_id in block_ids
+        }
+        return expected.issubset(self._requests[req_id].pushed_pairs)
 
-    def has_pushed_all_blocks(self, req_id: str, block_ids: set[int]) -> bool:
+    def is_done(self, req_id: str) -> bool:
         self.add_request(req_id)
-        return block_ids.issubset(self._requests[req_id].pushed_blocks)
+        return self._requests[req_id].done
 
     def mark_done(self, req_id: str) -> None:
         self.add_request(req_id)

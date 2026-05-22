@@ -98,10 +98,30 @@ impl ImmCountMap {
 
     /// Return an exposed imm counter.
     pub fn get_imm_counter(&self, imm: u32) -> ImmCounter {
-        let counter = Arc::new(AtomicI64::new(0));
-        let imm_counter = ImmCounter::new(counter.clone());
-        self.map.write().insert(imm, ImmCount::Imm { counter });
-        imm_counter
+        let mut map = self.map.write();
+        match map.get(&imm) {
+            Some(ImmCount::Imm { counter }) => ImmCounter::new(counter.clone()),
+            Some(_) => {
+                let counter = Arc::new(AtomicI64::new(0));
+                map.insert(
+                    imm,
+                    ImmCount::Imm {
+                        counter: counter.clone(),
+                    },
+                );
+                ImmCounter::new(counter)
+            }
+            None => {
+                let counter = Arc::new(AtomicI64::new(0));
+                map.insert(
+                    imm,
+                    ImmCount::Imm {
+                        counter: counter.clone(),
+                    },
+                );
+                ImmCounter::new(counter)
+            }
+        }
     }
 
     /// Return an exposed gdr counter.

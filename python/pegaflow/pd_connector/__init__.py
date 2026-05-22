@@ -34,6 +34,10 @@ class PdConnector(KVConnectorBase_V1, SupportsHMA):
     def get_required_kvcache_layout(cls, vllm_config: Any) -> str | None:
         return "HND"
 
+    @classmethod
+    def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
+        return True
+
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         if self._worker is not None:
             self._worker.register_kv_caches(kv_caches)
@@ -72,6 +76,11 @@ class PdConnector(KVConnectorBase_V1, SupportsHMA):
         if self._worker is None:
             return set()
         return self._worker.get_block_ids_with_load_errors()
+
+    def build_connector_worker_meta(self) -> Any | None:
+        if self._worker is None:
+            return None
+        return self._worker.build_connector_worker_meta()
 
     def shutdown(self) -> None:
         if self._worker is not None:

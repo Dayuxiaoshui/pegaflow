@@ -5,10 +5,10 @@ use pegaflow_proto::proto::engine::{
     UnregisterRequest, engine_client::EngineClient, query_response,
 };
 use pegaflow_transfer::v2::{
-    CudaDeviceId, CudaDeviceMemory, Device, DomainAddress, DomainGroupRouting, ImmCounter,
-    ImmTransferRequest, MemoryRegionDescriptor, MemoryRegionHandle, MemoryRegionRemoteKey,
-    RdmaEngine, SingleTransferRequest, SmallVec, TransferEngine, TransferEngineBuilder,
-    TransferRequest, detect_topology,
+    CudaDeviceId, CudaDeviceMemory, Device, DomainAddress, DomainGroupRouting,
+    GroupTransferRouting, ImmCounter, ImmTransferRequest, MemoryRegionDescriptor,
+    MemoryRegionHandle, MemoryRegionRemoteKey, RdmaEngine, ScatterTarget, ScatterTransferRequest,
+    SmallVec, TransferEngine, TransferEngineBuilder, TransferRequest, detect_topology,
 };
 use pyo3::{
     create_exception,
@@ -20,7 +20,6 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::c_void,
     future::Future,
-    num::NonZeroU8,
     ptr::NonNull,
     sync::atomic::{AtomicI64, Ordering},
     sync::{Arc, Mutex, OnceLock},
@@ -146,6 +145,7 @@ struct PdRemoteLayer {
 
 struct PdRemoteRequest {
     remote_request_id: String,
+    imm_data: u32,
     layers: HashMap<u64, PdRemoteLayer>,
 }
 
@@ -191,7 +191,6 @@ impl PdRdmaTestBuffer {
 struct PdRdmaEngine {
     engine: Arc<TransferEngine>,
     device: Device,
-    transfer_domain: DomainGroupRouting,
     imm_domain: DomainGroupRouting,
     local_layers: Mutex<HashMap<u64, PdLocalLayer>>,
     remote_requests: Mutex<HashMap<String, PdRemoteRequest>>,
@@ -306,10 +305,6 @@ impl PdRdmaEngine {
             }
             Ok(())
         }));
-        let nets_per_gpu = engine.nets_per_gpu();
-        let transfer_domain = DomainGroupRouting::RoundRobinSharded {
-            num_shards: NonZeroU8::new(nets_per_gpu.get()).expect("nets_per_gpu is non-zero"),
-        };
         let device = match device {
             "cuda" => Device::Cuda(CudaDeviceId(cuda_device)),
             "host" => Device::Host,
@@ -322,7 +317,6 @@ impl PdRdmaEngine {
         Ok(Self {
             engine,
             device,
-            transfer_domain,
             imm_domain: DomainGroupRouting::Pinned { domain_idx: 0 },
             local_layers: Mutex::new(HashMap::new()),
             remote_requests: Mutex::new(HashMap::new()),
@@ -395,7 +389,10 @@ impl PdRdmaEngine {
         };
         let handshake = handshake.bind(py);
         let remote_request_id: String = py_get(handshake, "request_id")?;
-        let imm = pd_imm(&remote_request_id);
+        let imm = match handshake.get_item("imm_id")? {
+            Some(value) if !value.is_none() => value.extract()?,
+            _ => pd_imm(&remote_request_id),
+        };
         self.imm_to_req.lock().unwrap().insert(imm, req_id.clone());
         self.imm_counters
             .lock()
@@ -445,6 +442,7 @@ impl PdRdmaEngine {
             req_id,
             PdRemoteRequest {
                 remote_request_id,
+                imm_data: imm,
                 layers,
             },
         );
@@ -480,7 +478,7 @@ impl PdRdmaEngine {
             })?;
         let tx_counter = Arc::new(AtomicI64::new(0));
         let err_counter = Arc::new(AtomicI64::new(0));
-        let mut submitted = 0i64;
+        let mut dsts = Vec::with_capacity(blocks.len() * 2);
         for block in blocks {
             let block = block.bind(py);
             let k = block
@@ -491,12 +489,30 @@ impl PdRdmaEngine {
                 .get_item("v")?
                 .ok_or_else(|| PyValueError::new_err("block missing v"))?
                 .cast_into::<PyDict>()?;
-            submitted +=
-                self.submit_block_slice(&local, &remote, &k, true, &tx_counter, &err_counter)?;
-            submitted +=
-                self.submit_block_slice(&local, &remote, &v, false, &tx_counter, &err_counter)?;
+            dsts.push(self.block_slice_to_scatter_target(&local, &remote, &k, true)?);
+            dsts.push(self.block_slice_to_scatter_target(&local, &remote, &v, false)?);
         }
-        if !py.detach(|| wait_atomic_count(&tx_counter, submitted, Duration::from_secs(30))) {
+        let submitted = if dsts.is_empty() {
+            0
+        } else {
+            self.engine
+                .submit_transfer_atomic(
+                    TransferRequest::Scatter(ScatterTransferRequest {
+                        src_mr: local.mr,
+                        dst_handle: None,
+                        dsts: Arc::new(dsts),
+                        imm_data: None,
+                        domain: GroupTransferRouting::AllDomainsShardBytes,
+                    }),
+                    Arc::clone(&tx_counter),
+                    Arc::clone(&err_counter),
+                )
+                .map_err(|err| pd_rdma_error("submit RDMA WRITE failed", err))?;
+            1
+        };
+        if submitted != 0
+            && !py.detach(|| wait_atomic_count(&tx_counter, submitted, Duration::from_secs(30)))
+        {
             return Err(PegaFlowError::new_err(format!(
                 "RDMA WRITE timed out for req={req_id} layer={layer_idx} submitted={submitted} completed={}",
                 tx_counter.load(Ordering::Acquire)
@@ -525,12 +541,12 @@ impl PdRdmaEngine {
             .next()
             .cloned()
             .ok_or_else(|| PyRuntimeError::new_err(format!("remote req {req_id} has no layers")))?;
-        let remote_request_id = self
+        let imm_data = self
             .remote_requests
             .lock()
             .unwrap()
             .get(&req_id)
-            .map(|request| request.remote_request_id.clone())
+            .map(|request| request.imm_data)
             .ok_or_else(|| {
                 PyRuntimeError::new_err(format!("remote req {req_id} is not registered"))
             })?;
@@ -539,7 +555,7 @@ impl PdRdmaEngine {
         self.engine
             .submit_transfer_atomic(
                 TransferRequest::Imm(ImmTransferRequest {
-                    imm_data: pd_imm(&remote_request_id),
+                    imm_data,
                     dst_mr: remote.mr_desc,
                     domain: self.imm_domain,
                 }),
@@ -564,13 +580,16 @@ impl PdRdmaEngine {
     }
 
     fn wait_done(&self, py: Python<'_>, req_id: String) -> PyResult<()> {
-        let remote_request_id = self
+        let (remote_request_id, imm_data) = self
             .remote_requests
             .lock()
             .unwrap()
             .get(&req_id)
-            .map(|request| request.remote_request_id.clone())
-            .unwrap_or_else(|| req_id.clone());
+            .map(|request| (request.remote_request_id.clone(), request.imm_data))
+            .unwrap_or_else(|| {
+                let fallback = pd_imm(&req_id);
+                (req_id.clone(), fallback)
+            });
         if self.finished_recving.lock().unwrap().remove(&req_id) {
             self.finished_recving.lock().unwrap().insert(req_id);
             return Ok(());
@@ -580,7 +599,7 @@ impl PdRdmaEngine {
             .lock()
             .unwrap()
             .entry(req_id.clone())
-            .or_insert_with(|| self.engine.get_imm_counter(pd_imm(&remote_request_id)))
+            .or_insert_with(|| self.engine.get_imm_counter(imm_data))
             .clone();
         let done = py.detach(|| counter.wait_timeout(1, Duration::from_secs(30)));
         if !done {
@@ -596,19 +615,19 @@ impl PdRdmaEngine {
         if self.finished_recving.lock().unwrap().contains(&req_id) {
             return true;
         }
-        let remote_request_id = self
+        let imm_data = self
             .remote_requests
             .lock()
             .unwrap()
             .get(&req_id)
-            .map(|request| request.remote_request_id.clone())
-            .unwrap_or_else(|| req_id.clone());
+            .map(|request| request.imm_data)
+            .unwrap_or_else(|| pd_imm(&req_id));
         let counter = self
             .imm_counters
             .lock()
             .unwrap()
             .entry(req_id.clone())
-            .or_insert_with(|| self.engine.get_imm_counter(pd_imm(&remote_request_id)))
+            .or_insert_with(|| self.engine.get_imm_counter(imm_data))
             .clone();
         if counter.wait_timeout(1, Duration::ZERO) {
             self.finished_recving.lock().unwrap().insert(req_id);
@@ -631,8 +650,8 @@ impl PdRdmaEngine {
 
     fn close_request(&self, req_id: String) {
         if let Some(request) = self.remote_requests.lock().unwrap().remove(&req_id) {
-            self.engine
-                .remove_imm_count(pd_imm(&request.remote_request_id));
+            self.engine.remove_imm_count(request.imm_data);
+            self.imm_to_req.lock().unwrap().remove(&request.imm_data);
         }
         self.imm_counters.lock().unwrap().remove(&req_id);
         self.finished_sending.lock().unwrap().remove(&req_id);
@@ -665,15 +684,13 @@ impl PdRdmaEngine {
 }
 
 impl PdRdmaEngine {
-    fn submit_block_slice(
+    fn block_slice_to_scatter_target(
         &self,
         local: &PdLocalLayer,
         remote: &PdRemoteLayer,
         block: &Bound<'_, PyDict>,
         is_k: bool,
-        tx_counter: &Arc<AtomicI64>,
-        err_counter: &Arc<AtomicI64>,
-    ) -> PyResult<i64> {
+    ) -> PyResult<ScatterTarget> {
         let block_id: u64 = py_get(block, "block_id")?;
         let src_offset: u64 = py_get(block, "src_offset_bytes")?;
         let bytes: u64 = py_get(block, "bytes")?;
@@ -705,22 +722,12 @@ impl PdRdmaEngine {
             ));
         }
         let src_mr_offset = src_absolute - local.mr_desc.ptr;
-        self.engine
-            .submit_transfer_atomic(
-                TransferRequest::Single(SingleTransferRequest {
-                    src_mr: local.mr,
-                    src_offset: src_mr_offset,
-                    length: bytes,
-                    imm_data: None,
-                    dst_mr: remote.mr_desc.clone(),
-                    dst_offset,
-                    domain: self.transfer_domain,
-                }),
-                Arc::clone(tx_counter),
-                Arc::clone(err_counter),
-            )
-            .map_err(|err| pd_rdma_error("submit RDMA WRITE failed", err))?;
-        Ok(1)
+        Ok(ScatterTarget {
+            dst_mr: remote.mr_desc.clone(),
+            length: bytes,
+            src_offset: src_mr_offset,
+            dst_offset,
+        })
     }
 }
 

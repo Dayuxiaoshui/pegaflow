@@ -21,6 +21,7 @@ native.QueryReady = object
 native.__version__ = "test"
 sys.modules["pegaflow.pegaflow"] = native
 
+from pegaflow.pd_connector import PdConnector  # noqa: E402
 from pegaflow.pd_connector.layout import (  # noqa: E402
     FlashAttnHndLayout,
     unique_blocks_from_slot_mapping,
@@ -29,6 +30,8 @@ from pegaflow.pd_connector.metadata import (  # noqa: E402
     LayerRemoteLayout,
     PdConnectorMetadata,
     PdHandshake,
+    PdWorkerMetadata,
+    PrefillDispatch,
     PushReqMeta,
     RemoteEndpoint,
     WaitReqMeta,
@@ -73,10 +76,15 @@ class FakeTensor:
 
 
 class FakeSlotMapping(list[int]):
+    def __init__(self, values: list[int]) -> None:
+        super().__init__(values)
+        self.cpu_calls = 0
+
     def detach(self):
         return self
 
     def cpu(self):
+        self.cpu_calls += 1
         return self
 
     def tolist(self):
@@ -120,6 +128,7 @@ class FakeNativeRdmaEngine:
     def register_remote(self, req_id, handshake):
         assert handshake is not None
         assert handshake["request_id"]
+        assert handshake.get("imm_id") is None or isinstance(handshake["imm_id"], int)
         for layer in handshake["layers"]:
             assert layer["mr_desc"]["addr_rkey_list"]
             assert isinstance(layer["mr_desc"]["addr_rkey_list"][0], tuple)
@@ -381,11 +390,42 @@ def test_pd_worker_pushes_flash_attn_hnd_blocks() -> None:
     worker.save_kv_layer("layer.1", tensor, attn_metadata)
 
     assert unique_blocks_from_slot_mapping(attn_metadata.slot_mapping, 16) == {1, 2}
+    worker.wait_for_save()
     assert worker.rdma.pushed_layers["req-1"][0][0] == 0
     assert worker.rdma.pushed_layers["req-1"][1][0] == 1
     finished_sending, finished_recving = worker.get_finished(set())
     assert finished_sending == {"req-1"}
     assert finished_recving is None
+
+
+def test_p_worker_extracts_slot_mapping_blocks_once_per_forward() -> None:
+    tensor = FakeTensor(
+        shape=(2, 8, 16, 4, 32),
+        stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+    )
+    worker = PdWorkerConnector(SimpleNamespace(), rdma=MockRdmaPort())
+    worker.register_kv_caches({"layer.0": tensor, "layer.1": tensor})
+    worker.start_load_kv(
+        PdConnectorMetadata(
+            reqs_to_push={
+                "req-1": PushReqMeta(
+                    local_block_ids=([1],),
+                    target=RemoteEndpoint(engine_id="decode"),
+                    target_request_id="decode",
+                    num_prompt_tokens=16,
+                )
+            }
+        ),
+        None,
+    )
+
+    slot_mapping = FakeSlotMapping([16, 17])
+    attn_metadata = SimpleNamespace(slot_mapping=slot_mapping)
+    worker.save_kv_layer("layer.0", tensor, attn_metadata)
+    worker.save_kv_layer("layer.1", tensor, attn_metadata)
+
+    assert slot_mapping.cpu_calls == 1
+    worker.wait_for_save()
 
 
 def test_pd_worker_publishes_wait_handshake_and_delays_done_until_all_blocks() -> None:
@@ -438,6 +478,7 @@ def test_pd_worker_publishes_wait_handshake_and_delays_done_until_all_blocks() -
         "target_request_id": "req-1",
     }
     assert producer_handshake["request_id"] == "req-1"
+    assert isinstance(producer_handshake["imm_id"], int)
     assert producer_handshake["layers"][0]["block_ids"] == [1, 2]
 
     push_worker = PdWorkerConnector(SimpleNamespace(), rdma=MockRdmaPort(), oob=oob)
@@ -455,20 +496,48 @@ def test_pd_worker_publishes_wait_handshake_and_delays_done_until_all_blocks() -
     push_worker.start_load_kv(push_meta, None)
     assert push_worker.rdma.remote_handshakes["req-1"] is handshake
 
+    push_worker.start_load_kv(
+        PdConnectorMetadata(
+            reqs_to_push={
+                "req-1": PushReqMeta(
+                    local_block_ids=([1],),
+                    target=RemoteEndpoint(engine_id="decode"),
+                    target_request_id="req-1",
+                    num_prompt_tokens=32,
+                )
+            }
+        ),
+        None,
+    )
     push_worker.save_kv_layer(
         "layer.0", tensor, SimpleNamespace(slot_mapping=FakeSlotMapping([16]))
     )
     push_worker.save_kv_layer(
         "layer.1", tensor, SimpleNamespace(slot_mapping=FakeSlotMapping([16]))
     )
+    push_worker.wait_for_save()
     assert push_worker.get_finished(set()) == (None, None)
 
+    push_worker.start_load_kv(
+        PdConnectorMetadata(
+            reqs_to_push={
+                "req-1": PushReqMeta(
+                    local_block_ids=([2],),
+                    target=RemoteEndpoint(engine_id="decode"),
+                    target_request_id="req-1",
+                    num_prompt_tokens=32,
+                )
+            }
+        ),
+        None,
+    )
     push_worker.save_kv_layer(
         "layer.0", tensor, SimpleNamespace(slot_mapping=FakeSlotMapping([32]))
     )
     push_worker.save_kv_layer(
         "layer.1", tensor, SimpleNamespace(slot_mapping=FakeSlotMapping([32]))
     )
+    push_worker.wait_for_save()
     assert push_worker.get_finished(set()) == ({"req-1"}, None)
 
 
@@ -499,6 +568,35 @@ def test_scheduler_delays_producer_block_free_until_send_finishes() -> None:
     )
     release_meta = scheduler.build_connector_meta(SimpleNamespace())
     assert release_meta.reqs_to_release == {"req-1"}
+
+
+def test_scheduler_emits_cached_producer_chunks() -> None:
+    scheduler = PdSchedulerConnector(
+        SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="p"))
+    )
+    request = SimpleNamespace(
+        request_id="req-1",
+        num_prompt_tokens=10000,
+        kv_transfer_params={
+            "do_remote_prefill_sender": True,
+            "target_engine_id": "decode",
+            "target_request_id": "decode-1",
+        },
+    )
+
+    scheduler.update_state_after_alloc(request, ([1, 2],), num_external_tokens=0)
+    first = scheduler.build_connector_meta(
+        SimpleNamespace(scheduled_cached_reqs=None, total_num_scheduled_tokens=8192)
+    )
+    assert first.reqs_to_push["req-1"].local_block_ids == ([1, 2],)
+
+    cached = SimpleNamespace(req_ids=["req-1"], new_block_ids=[([3],)])
+    second = scheduler.build_connector_meta(
+        SimpleNamespace(scheduled_cached_reqs=cached, total_num_scheduled_tokens=1808)
+    )
+
+    assert second.reqs_to_push["req-1"].local_block_ids == ([3],)
+    assert second.reqs_to_push["req-1"].target_request_id == "decode-1"
 
 
 def test_scheduler_carries_prompt_tokens_for_d_to_p_oob() -> None:
@@ -562,7 +660,7 @@ def test_scheduler_carries_cross_process_rdma_handshake() -> None:
     assert parsed.layers[0].mr_desc == {"addr_rkey_list": [["10.0.0.1:1", 17]]}
 
 
-def test_scheduler_carries_fake_rdma_done_endpoint() -> None:
+def test_scheduler_ignores_legacy_fake_rdma_done_endpoint() -> None:
     scheduler = PdSchedulerConnector(
         SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="d"))
     )
@@ -580,8 +678,8 @@ def test_scheduler_carries_fake_rdma_done_endpoint() -> None:
     scheduler.update_state_after_alloc(request, ([1],), num_external_tokens=3)
     meta = scheduler.build_connector_meta(SimpleNamespace())
 
-    assert meta.reqs_to_wait["req-1"].remote.done_endpoint == "tcp://127.0.0.1:7200"
     assert meta.reqs_to_wait["req-1"].done_request_id == "req-1"
+    assert not hasattr(meta.reqs_to_wait["req-1"].remote, "done_endpoint")
 
 
 def test_scheduler_registers_remote_wait_once_until_done() -> None:
@@ -596,7 +694,6 @@ def test_scheduler_registers_remote_wait_once_until_done() -> None:
             "do_remote_prefill": True,
             "remote_engine_id": "prefill",
             "prefill_url": "http://127.0.0.1:8001",
-            "done_endpoint": "tcp://127.0.0.1:7200",
         },
     )
 
@@ -623,29 +720,24 @@ def test_scheduler_registers_remote_wait_once_until_done() -> None:
     assert set(after_release.reqs_to_wait) == {"req-1"}
 
 
-def test_d_worker_submits_prefill_request_after_alloc() -> None:
+def test_d_worker_reports_handshake_after_alloc() -> None:
     tensor = FakeTensor(
         shape=(2, 8, 16, 4, 32),
         stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
     )
-    prefill_sender = FakePrefillSender()
     worker = PdWorkerConnector(
         SimpleNamespace(
             kv_transfer_config=SimpleNamespace(engine_id="decode"),
             parallel_config=SimpleNamespace(tensor_parallel_rank=0, tensor_parallel_size=1),
         ),
         rdma=MockRdmaPort(),
-        prefill_sender=prefill_sender,
     )
     worker.register_kv_caches({"layer.0": tensor})
     meta = PdConnectorMetadata(
         reqs_to_wait={
             "internal-d": WaitReqMeta(
                 local_block_ids=([1],),
-                remote=RemoteEndpoint(
-                    engine_id="prefill",
-                    done_endpoint="tcp://127.0.0.1:7200",
-                ),
+                remote=RemoteEndpoint(engine_id="prefill"),
                 remote_request_id="external-p",
                 done_request_id="external-d",
                 num_prompt_tokens=3,
@@ -659,29 +751,453 @@ def test_d_worker_submits_prefill_request_after_alloc() -> None:
 
     worker.start_load_kv(meta, None)
 
+    worker_meta = worker.build_connector_worker_meta()
+    assert isinstance(worker_meta, PdWorkerMetadata)
+    handshake = worker_meta.handshakes["internal-d"][0]
+    assert handshake.request_id == "external-d"
+    assert handshake.imm_id is not None
+    assert handshake.layers[0].block_ids == (1,)
+
+
+def test_scheduler_fans_in_handshakes_before_prefill_dispatch() -> None:
+    tensor = FakeTensor(
+        shape=(2, 8, 16, 4, 32),
+        stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+    )
+    scheduler = PdSchedulerConnector(
+        SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="decode"))
+    )
+    request = SimpleNamespace(
+        request_id="internal-d",
+        num_prompt_tokens=3,
+        prompt_token_ids=[11, 12, 13],
+        kv_transfer_params={
+            "do_remote_prefill": True,
+            "remote_engine_id": "prefill",
+            "remote_request_id": "external-p",
+            "done_request_id": "external-d",
+            "prefill_url": "http://127.0.0.1:8001",
+            "prefill_max_tokens": 1,
+            "model": "/data/Qwen3-4B",
+        },
+    )
+    scheduler.update_state_after_alloc(request, ([1],), num_external_tokens=3)
+    wait_meta = scheduler.build_connector_meta(SimpleNamespace())
+    assert set(wait_meta.reqs_to_wait) == {"internal-d"}
+
+    handshakes = {
+        rank: PdHandshake(
+            request_id="external-d",
+            engine_id="decode",
+            tp_rank=rank,
+            tp_size=2,
+            block_size=16,
+            kv_layout="HND",
+            layers=(
+                FlashAttnHndLayout.from_tensor("layer.0", tensor).remote_layout(0, {rank + 1}),
+            ),
+        )
+        for rank in (0, 1)
+    }
+    scheduler.update_connector_output(
+        SimpleNamespace(
+            finished_sending=None,
+            finished_recving=None,
+            kv_connector_worker_meta=PdWorkerMetadata(
+                handshakes={"internal-d": {0: handshakes[0]}}
+            ),
+        )
+    )
+    partial_dispatch_meta = scheduler.build_connector_meta(SimpleNamespace())
+    assert partial_dispatch_meta.prefill_dispatches == {}
+
+    scheduler.update_connector_output(
+        SimpleNamespace(
+            finished_sending=None,
+            finished_recving=None,
+            kv_connector_worker_meta=PdWorkerMetadata(
+                handshakes={"internal-d": {1: handshakes[1]}}
+            ),
+        )
+    )
+    dispatch_meta = scheduler.build_connector_meta(SimpleNamespace())
+
+    dispatch = dispatch_meta.prefill_dispatches["internal-d"]
+    assert dispatch.request_id == "external-p"
+    assert dispatch.target_request_id == "external-d"
+    assert [handshake.tp_rank for handshake in dispatch.handshakes] == [0, 1]
+
+
+def test_p_worker_selects_matching_tp_rank_handshake() -> None:
+    tensor = FakeTensor(
+        shape=(2, 8, 16, 4, 32),
+        stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+    )
+    handshakes = (
+        PdHandshake(
+            request_id="decode-r0",
+            engine_id="decode",
+            tp_rank=0,
+            tp_size=2,
+            block_size=16,
+            kv_layout="HND",
+            layers=(),
+        ),
+        PdHandshake(
+            request_id="decode-r1",
+            engine_id="decode",
+            tp_rank=1,
+            tp_size=2,
+            block_size=16,
+            kv_layout="HND",
+            layers=(),
+        ),
+    )
+    worker = PdWorkerConnector(
+        SimpleNamespace(
+            parallel_config=SimpleNamespace(tensor_parallel_rank=1, tensor_parallel_size=2)
+        ),
+        rdma=MockRdmaPort(),
+    )
+    worker.register_kv_caches({"layer.0": tensor})
+    worker.start_load_kv(
+        PdConnectorMetadata(
+            reqs_to_push={
+                "prefill-r1": PushReqMeta(
+                    local_block_ids=([1],),
+                    target=RemoteEndpoint(engine_id="decode"),
+                    target_request_id="decode",
+                    num_prompt_tokens=3,
+                    handshakes=handshakes,
+                )
+            }
+        ),
+        None,
+    )
+
+    assert worker.rdma.remote_handshakes["prefill-r1"] is handshakes[1]
+
+
+def test_p_worker_pushes_registered_blocks_from_save_kv_layer() -> None:
+    tensor = FakeTensor(
+        shape=(2, 8, 16, 4, 32),
+        stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+    )
+    rdma = MockRdmaPort()
+    worker = PdWorkerConnector(
+        SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(engine_id="prefill"),
+            parallel_config=SimpleNamespace(tensor_parallel_rank=0, tensor_parallel_size=1),
+        ),
+        rdma=rdma,
+    )
+    worker.register_kv_caches({"layer.0": tensor, "layer.1": tensor})
+    worker.start_load_kv(
+        PdConnectorMetadata(
+            reqs_to_push={
+                "prefill-r0": PushReqMeta(
+                    local_block_ids=([1],),
+                    target=RemoteEndpoint(engine_id="decode"),
+                    target_request_id="decode",
+                    num_prompt_tokens=3,
+                    handshake=PdHandshake(
+                        request_id="decode",
+                        engine_id="decode",
+                        tp_rank=0,
+                        tp_size=1,
+                        block_size=16,
+                        kv_layout="HND",
+                        layers=(),
+                    ),
+                )
+            }
+        ),
+        None,
+    )
+
+    attn_metadata = SimpleNamespace(slot_mapping=FakeSlotMapping([16]))
+    worker.save_kv_layer("layer.0", tensor, attn_metadata)
+    worker.save_kv_layer("layer.1", tensor, attn_metadata)
+    worker.wait_for_save()
+
+    assert [layer_idx for layer_idx, _ in rdma.pushed_layers["prefill-r0"]] == [0, 1]
+    assert worker.get_finished(set())[0] == {"prefill-r0"}
+
+
+def test_p_worker_maps_local_blocks_to_remote_blocks_by_position() -> None:
+    tensor = FakeTensor(
+        shape=(2, 16, 16, 4, 32),
+        stride=(16 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+    )
+    rdma = MockRdmaPort()
+    worker = PdWorkerConnector(
+        SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(engine_id="prefill"),
+            parallel_config=SimpleNamespace(tensor_parallel_rank=0, tensor_parallel_size=1),
+        ),
+        rdma=rdma,
+    )
+    worker.register_kv_caches({"layer.0": tensor})
+    worker.start_load_kv(
+        PdConnectorMetadata(
+            reqs_to_push={
+                "prefill-r0": PushReqMeta(
+                    local_block_ids=([3, 4],),
+                    target=RemoteEndpoint(engine_id="decode"),
+                    target_request_id="decode",
+                    num_prompt_tokens=32,
+                    handshake=PdHandshake(
+                        request_id="decode",
+                        engine_id="decode",
+                        tp_rank=0,
+                        tp_size=1,
+                        block_size=16,
+                        kv_layout="HND",
+                        layers=(
+                            LayerRemoteLayout(
+                                layer_name="layer.0",
+                                layer_idx=0,
+                                base_addr=0x1000,
+                                block_bytes=4096,
+                                block_ids=(68, 69),
+                                k_block_addrs=(0x1000, 0x2000),
+                                v_block_addrs=(0x3000, 0x4000),
+                            ),
+                        ),
+                    ),
+                )
+            }
+        ),
+        None,
+    )
+
+    worker.save_kv_layer(
+        "layer.0",
+        tensor,
+        SimpleNamespace(slot_mapping=FakeSlotMapping([3 * 16, 4 * 16])),
+    )
+    worker.wait_for_save()
+
+    _, pushed = rdma.pushed_layers["prefill-r0"][0]
+    assert [block.k.block_id for block in pushed] == [68, 69]
+    assert len(rdma.pushed_layers["prefill-r0"]) == 1
+    assert [block.k.src_offset_bytes for block in pushed] == [
+        tensor.stride()[1] * 3 * tensor.element_size(),
+        tensor.stride()[1] * 4 * tensor.element_size(),
+    ]
+
+
+def test_p_worker_advances_remote_blocks_across_chunk_prefill() -> None:
+    tensor = FakeTensor(
+        shape=(2, 16, 16, 4, 32),
+        stride=(16 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+    )
+    rdma = MockRdmaPort()
+    worker = PdWorkerConnector(
+        SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(engine_id="prefill"),
+            parallel_config=SimpleNamespace(tensor_parallel_rank=0, tensor_parallel_size=1),
+        ),
+        rdma=rdma,
+    )
+    worker.register_kv_caches({"layer.0": tensor})
+    handshake = PdHandshake(
+        request_id="decode",
+        engine_id="decode",
+        tp_rank=0,
+        tp_size=1,
+        block_size=16,
+        kv_layout="HND",
+        layers=(
+            LayerRemoteLayout(
+                layer_name="layer.0",
+                layer_idx=0,
+                base_addr=0x1000,
+                block_bytes=4096,
+                block_ids=(68, 69, 70, 71),
+                k_block_addrs=(0x1000, 0x2000, 0x3000, 0x4000),
+                v_block_addrs=(0x5000, 0x6000, 0x7000, 0x8000),
+            ),
+        ),
+    )
+
+    worker.start_load_kv(
+        PdConnectorMetadata(
+            reqs_to_push={
+                "prefill-r0": PushReqMeta(
+                    local_block_ids=([3, 4],),
+                    target=RemoteEndpoint(engine_id="decode"),
+                    target_request_id="decode",
+                    num_prompt_tokens=64,
+                    handshake=handshake,
+                )
+            }
+        ),
+        None,
+    )
+    worker.save_kv_layer(
+        "layer.0",
+        tensor,
+        SimpleNamespace(slot_mapping=FakeSlotMapping([3 * 16, 4 * 16])),
+    )
+    worker.wait_for_save()
+
+    assert worker.get_finished(set())[0] is None
+    assert [block.k.block_id for block in rdma.pushed_layers["prefill-r0"][0][1]] == [68, 69]
+    assert len(rdma.pushed_layers["prefill-r0"]) == 1
+
+    worker.start_load_kv(
+        PdConnectorMetadata(
+            reqs_to_push={
+                "prefill-r0": PushReqMeta(
+                    local_block_ids=([5, 6],),
+                    target=RemoteEndpoint(engine_id="decode"),
+                    target_request_id="decode",
+                    num_prompt_tokens=64,
+                    handshake=handshake,
+                )
+            }
+        ),
+        None,
+    )
+    worker.save_kv_layer(
+        "layer.0",
+        tensor,
+        SimpleNamespace(slot_mapping=FakeSlotMapping([5 * 16, 6 * 16])),
+    )
+    worker.wait_for_save()
+
+    assert [block.k.block_id for block in rdma.pushed_layers["prefill-r0"][1][1]] == [70, 71]
+    assert worker.get_finished(set())[0] == {"prefill-r0"}
+
+
+def test_d_rank0_submits_scheduler_prefill_dispatch() -> None:
+    handshakes = (
+        PdHandshake(
+            request_id="external-d",
+            engine_id="decode",
+            tp_rank=0,
+            tp_size=2,
+            block_size=16,
+            kv_layout="HND",
+            layers=(),
+        ),
+        PdHandshake(
+            request_id="external-d",
+            engine_id="decode",
+            tp_rank=1,
+            tp_size=2,
+            block_size=16,
+            kv_layout="HND",
+            layers=(),
+        ),
+    )
+    prefill_sender = FakePrefillSender()
+    worker = PdWorkerConnector(
+        SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(engine_id="decode"),
+            parallel_config=SimpleNamespace(tensor_parallel_rank=0, tensor_parallel_size=2),
+        ),
+        rdma=MockRdmaPort(),
+        prefill_sender=prefill_sender,
+    )
+    worker.register_kv_caches(
+        {
+            "layer.0": FakeTensor(
+                shape=(2, 8, 16, 4, 32),
+                stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+            )
+        }
+    )
+    worker.start_load_kv(
+        PdConnectorMetadata(
+            prefill_dispatches={
+                "internal-d": PrefillDispatch(
+                    request_id="external-p",
+                    prefill_url="http://127.0.0.1:8001",
+                    model="/data/Qwen3-4B",
+                    prompt_token_ids=(11, 12, 13),
+                    max_tokens=1,
+                    target_engine_id="decode",
+                    target_request_id="external-d",
+                    handshakes=handshakes,
+                )
+            }
+        ),
+        None,
+    )
+
     assert len(prefill_sender.tasks) == 1
     task = prefill_sender.tasks[0]
     assert task.request_id == "external-p"
-    assert task.prefill_url == "http://127.0.0.1:8001"
-    assert task.model == "/data/Qwen3-4B"
-    assert task.prompt_token_ids == (11, 12, 13)
-    task_params = dict(task.kv_transfer_params)
-    task_handshake = task_params.pop("pd_handshake")
-    assert task_params == {
-        "do_remote_prefill_sender": True,
-        "target_engine_id": "decode",
-        "target_request_id": "external-d",
-        "done_endpoint": "tcp://127.0.0.1:7200",
-    }
-    assert task_handshake["request_id"] == "internal-d"
-    assert task_handshake["layers"][0]["block_ids"] == [1]
+    assert [handshake["tp_rank"] for handshake in task.kv_transfer_params["pd_handshakes"]] == [
+        0,
+        1,
+    ]
+
+
+def test_d_non_rank0_does_not_submit_prefill_dispatch() -> None:
+    prefill_sender = FakePrefillSender()
+    worker = PdWorkerConnector(
+        SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(engine_id="decode"),
+            parallel_config=SimpleNamespace(tensor_parallel_rank=1, tensor_parallel_size=2),
+        ),
+        rdma=MockRdmaPort(),
+        prefill_sender=prefill_sender,
+    )
+    worker.register_kv_caches(
+        {
+            "layer.0": FakeTensor(
+                shape=(2, 8, 16, 4, 32),
+                stride=(8 * 4 * 16 * 32, 4 * 16 * 32, 32, 16 * 32, 1),
+            )
+        }
+    )
+    worker.start_load_kv(
+        PdConnectorMetadata(
+            prefill_dispatches={
+                "internal-d": PrefillDispatch(
+                    request_id="external-p",
+                    prefill_url="http://127.0.0.1:8001",
+                    model="/data/Qwen3-4B",
+                    prompt_token_ids=(11, 12, 13),
+                    max_tokens=1,
+                    target_engine_id="decode",
+                    target_request_id="external-d",
+                    handshakes=(
+                        PdHandshake(
+                            request_id="external-d",
+                            engine_id="decode",
+                            tp_rank=0,
+                            tp_size=2,
+                            block_size=16,
+                            kv_layout="HND",
+                            layers=(),
+                        ),
+                        PdHandshake(
+                            request_id="external-d",
+                            engine_id="decode",
+                            tp_rank=1,
+                            tp_size=2,
+                            block_size=16,
+                            kv_layout="HND",
+                            layers=(),
+                        ),
+                    ),
+                )
+            }
+        ),
+        None,
+    )
+
+    assert prefill_sender.tasks == []
 
 
 def test_pd_proxy_only_sends_decode_request_with_prefill_hint() -> None:
     config = ProxyConfig(
         prefill_url="http://127.0.0.1:8001",
         decode_url="http://127.0.0.1:8002",
-        done_endpoint="tcp://127.0.0.1:7200",
         timeout_s=30,
         prefill_max_tokens=1,
     )
@@ -698,6 +1214,7 @@ def test_pd_proxy_only_sends_decode_request_with_prefill_hint() -> None:
 
     assert req.decode_body["request_id"] == "pd-test-d"
     assert req.decode_body["max_tokens"] == 4
+    assert "stream" not in req.decode_body
     assert req.decode_body["kv_transfer_params"] == {
         "do_remote_prefill": True,
         "model": "/data/Qwen3-4B",
@@ -706,5 +1223,30 @@ def test_pd_proxy_only_sends_decode_request_with_prefill_hint() -> None:
         "remote_engine_id": "prefill",
         "remote_request_id": "pd-test-p",
         "done_request_id": "pd-test-d",
-        "done_endpoint": "tcp://127.0.0.1:7200",
     }
+
+
+def test_pd_proxy_preserves_streaming_decode_request() -> None:
+    config = ProxyConfig(
+        prefill_url="http://127.0.0.1:8001",
+        decode_url="http://127.0.0.1:8002",
+        timeout_s=30,
+        prefill_max_tokens=1,
+    )
+
+    req = build_pd_proxy_request(
+        {
+            "model": "/data/Qwen3-4B",
+            "prompt": "hello",
+            "max_tokens": 4,
+            "stream": True,
+        },
+        config,
+        request_id="pd-test",
+    )
+
+    assert req.decode_body["stream"] is True
+
+
+def test_pd_connector_requires_piecewise_cudagraph_for_layer_push() -> None:
+    assert PdConnector.requires_piecewise_for_cudagraph({}) is True

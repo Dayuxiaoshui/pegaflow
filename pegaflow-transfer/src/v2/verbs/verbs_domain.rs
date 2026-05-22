@@ -20,8 +20,8 @@ use crate::libibverbs_sys::{
     ibv_query_gid, ibv_query_port_wrap, ibv_recv_wr, ibv_reg_mr, ibv_send_wr, ibv_sge, ibv_srq,
     ibv_srq_attr, ibv_srq_init_attr, ibv_td, ibv_td_init_attr, ibv_wc, ibv_wc_status_str,
 };
-use libc::ENOMEM;
-use log::{debug, error, warn};
+use libc::{ENOMEM, RTLD_LAZY, dlopen, dlsym};
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 
 const MAX_OPS: usize = 1024;
@@ -31,6 +31,24 @@ const GRH_BYTES: usize = 40;
 const MAX_UD_MSG_BYTES: usize = 4096;
 const NUM_UD_RECVS: usize = 128;
 const MAX_UD_SENDS: usize = 128;
+
+type IbvRegDmabufMr = unsafe extern "C" fn(*mut ibv_pd, u64, usize, u64, i32, i32) -> *mut ibv_mr;
+
+fn ibv_reg_dmabuf_mr() -> Option<IbvRegDmabufMr> {
+    static SYMBOL: std::sync::OnceLock<Option<IbvRegDmabufMr>> = std::sync::OnceLock::new();
+    *SYMBOL.get_or_init(|| unsafe {
+        let handle = dlopen(c"libibverbs.so.1".as_ptr(), RTLD_LAZY);
+        if handle.is_null() {
+            return None;
+        }
+        let symbol = dlsym(handle, c"ibv_reg_dmabuf_mr".as_ptr());
+        if symbol.is_null() {
+            None
+        } else {
+            Some(transmute::<*mut c_void, IbvRegDmabufMr>(symbol))
+        }
+    })
+}
 
 use crate::v2::{
     api::{DomainAddress, MemoryRegionRemoteKey, PeerGroupHandle, TransferId},
@@ -205,6 +223,20 @@ impl VerbsDomain {
                 return Err(VerbsError::with_code(errno, "ibv_query_gid").into());
             }
             let gid = Gid { raw: gid.raw };
+            info!(
+                "Opened VerbsDomain domain={name} port={} gid_index={} gid={} lid={} mtu={:?} link_layer={} link_speed={}",
+                info.port_num,
+                info.gid_index,
+                gid,
+                lid,
+                mtu,
+                if is_infiniband {
+                    "InfiniBand"
+                } else {
+                    "Ethernet"
+                },
+                info.link_speed(),
+            );
             // TODO: p_key partition key
 
             // Thread domain to remove locks now that we are single-threaded.
@@ -649,19 +681,47 @@ impl VerbsDomain {
             access |= IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
         }
 
-        // TODO: GPU dma-buf memory must use ibv_reg_dmabuf_mr once sideway/rdma-mummy-sys
-        // exposes it. This temporary ibv_reg_mr path exists to keep CPU-memory benchmarks
-        // buildable while the upstream binding gap is fixed.
-        let mr = unsafe {
-            ibv_reg_mr(
-                self.pd.as_ptr(),
-                region.ptr().as_ptr(),
-                region.len(),
-                access as i32,
-            )
+        let mr = match region.mapping() {
+            Mapping::Device {
+                dmabuf_fd: Some(dmabuf_fd),
+                ..
+            } => {
+                let iova = region.ptr().as_ptr() as u64;
+                let reg_dmabuf_mr = ibv_reg_dmabuf_mr().ok_or(FabricLibError::Custom(
+                    "libibverbs does not expose ibv_reg_dmabuf_mr",
+                ))?;
+                let mr = unsafe {
+                    reg_dmabuf_mr(
+                        self.pd.as_ptr(),
+                        0,
+                        region.len(),
+                        iova,
+                        *dmabuf_fd,
+                        access as i32,
+                    )
+                };
+                NonNull::new(mr)
+                    .ok_or_else(|| VerbsError::with_last_os_error("ibv_reg_dmabuf_mr"))?
+            }
+            Mapping::Device {
+                dmabuf_fd: None, ..
+            } => {
+                return Err(FabricLibError::Custom(
+                    "CUDA memory registration requires a dma-buf fd",
+                ));
+            }
+            Mapping::Host => {
+                let mr = unsafe {
+                    ibv_reg_mr(
+                        self.pd.as_ptr(),
+                        region.ptr().as_ptr(),
+                        region.len(),
+                        access as i32,
+                    )
+                };
+                NonNull::new(mr).ok_or_else(|| VerbsError::with_last_os_error("ibv_reg_mr"))?
+            }
         };
-
-        let mr = NonNull::new(mr).ok_or_else(|| VerbsError::with_last_os_error("ibv_reg_mr"))?;
         self.local_mr_map.insert(region.ptr(), mr);
         Ok(MemoryRegionRemoteKey(unsafe { mr.as_ref() }.rkey as u64))
     }

@@ -5,7 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+    KVConnectorMetadata,
+    KVConnectorWorkerMetadata,
+)
 
 BlockIds = tuple[list[int], ...]
 
@@ -42,7 +45,6 @@ class RemoteEndpoint:
     host: str | None = None
     port: int | None = None
     tp_size: int = 1
-    done_endpoint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -65,6 +67,7 @@ class PushReqMeta:
     target_request_id: str
     num_prompt_tokens: int
     handshake: PdHandshake | None = None
+    handshakes: tuple[PdHandshake, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -88,6 +91,7 @@ class PdHandshake:
     block_size: int
     kv_layout: str
     layers: tuple[LayerRemoteLayout, ...]
+    imm_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -96,6 +100,18 @@ class PdPrefillRequest:
     prompt_token_ids: tuple[int, ...]
     producer_kv_transfer_params: dict[str, Any]
     handshake: PdHandshake
+
+
+@dataclass(frozen=True)
+class PrefillDispatch:
+    request_id: str
+    prefill_url: str
+    model: str
+    prompt_token_ids: tuple[int, ...]
+    max_tokens: int
+    target_engine_id: str
+    target_request_id: str
+    handshakes: tuple[PdHandshake, ...]
 
 
 def layer_layout_from_dict(data: dict[str, Any]) -> LayerRemoteLayout:
@@ -122,7 +138,17 @@ def handshake_from_dict(data: dict[str, Any] | None) -> PdHandshake | None:
         block_size=int(data["block_size"]),
         kv_layout=str(data["kv_layout"]),
         layers=tuple(layer_layout_from_dict(layer) for layer in data["layers"]),
+        imm_id=int(data["imm_id"]) if data.get("imm_id") is not None else None,
     )
+
+
+def handshakes_from_dicts(data: Any) -> tuple[PdHandshake, ...]:
+    if data is None:
+        return ()
+    iterable = data.values() if isinstance(data, dict) else data
+    handshakes = tuple(handshake_from_dict(item) for item in iterable)
+    assert all(handshake is not None for handshake in handshakes)
+    return handshakes  # type: ignore[return-value]
 
 
 def layer_layout_to_dict(layer: LayerRemoteLayout) -> dict[str, Any]:
@@ -149,6 +175,7 @@ def handshake_to_dict(handshake: PdHandshake | None) -> dict[str, Any] | None:
         "block_size": handshake.block_size,
         "kv_layout": handshake.kv_layout,
         "layers": [layer_layout_to_dict(layer) for layer in handshake.layers],
+        "imm_id": handshake.imm_id,
     }
 
 
@@ -159,11 +186,13 @@ class PdConnectorMetadata(KVConnectorMetadata):
         self,
         reqs_to_wait: dict[str, WaitReqMeta] | None = None,
         reqs_to_push: dict[str, PushReqMeta] | None = None,
+        prefill_dispatches: dict[str, PrefillDispatch] | None = None,
         reqs_to_release: set[str] | None = None,
     ) -> None:
         super().__init__()
         self.reqs_to_wait = reqs_to_wait or {}
         self.reqs_to_push = reqs_to_push or {}
+        self.prefill_dispatches = prefill_dispatches or {}
         self.reqs_to_release = reqs_to_release or set()
 
     def __repr__(self) -> str:
@@ -171,8 +200,21 @@ class PdConnectorMetadata(KVConnectorMetadata):
             "PdConnectorMetadata("
             f"wait={len(self.reqs_to_wait)}, "
             f"push={len(self.reqs_to_push)}, "
+            f"dispatch={len(self.prefill_dispatches)}, "
             f"release={len(self.reqs_to_release)})"
         )
+
+
+@dataclass
+class PdWorkerMetadata(KVConnectorWorkerMetadata):
+    handshakes: dict[str, dict[int, PdHandshake]] = field(default_factory=dict)
+
+    def aggregate(self, other: KVConnectorWorkerMetadata) -> KVConnectorWorkerMetadata:
+        assert isinstance(other, PdWorkerMetadata)
+        merged = {req_id: dict(by_rank) for req_id, by_rank in self.handshakes.items()}
+        for req_id, by_rank in other.handshakes.items():
+            merged.setdefault(req_id, {}).update(by_rank)
+        return PdWorkerMetadata(handshakes=merged)
 
 
 @dataclass

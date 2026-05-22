@@ -30,6 +30,8 @@ class RdmaPort(Protocol):
         blocks: list[LayerBlockSlices],
     ) -> None: ...
 
+    def wait_for_pushes(self, req_id: str) -> None: ...
+
     def push_done(self, req_id: str) -> None: ...
 
     def wait_done(self, req_id: str) -> None: ...
@@ -41,6 +43,8 @@ class RdmaPort(Protocol):
     def pop_finished_sending(self) -> set[str]: ...
 
     def pop_finished_recving(self) -> set[str]: ...
+
+    def close_request(self, req_id: str) -> None: ...
 
 
 class MockRdmaPort:
@@ -73,6 +77,9 @@ class MockRdmaPort:
         self.pushed_layers.setdefault(req_id, [])
         self.pushed_layers[req_id].append((layer_idx, blocks))
 
+    def wait_for_pushes(self, req_id: str) -> None:
+        return None
+
     def push_done(self, req_id: str) -> None:
         self._finished_sending.add(req_id)
 
@@ -94,6 +101,13 @@ class MockRdmaPort:
         finished = self._finished_recving
         self._finished_recving = set()
         return finished
+
+    def close_request(self, req_id: str) -> None:
+        self.registered.discard(req_id)
+        self.remote_handshakes.pop(req_id, None)
+        self.pushed_layers.pop(req_id, None)
+        self._finished_sending.discard(req_id)
+        self._finished_recving.discard(req_id)
 
 
 def _block_slice_to_native(block: BlockSlice) -> dict[str, int]:
@@ -198,6 +212,12 @@ class RealRdmaPort:
     ) -> None:
         self.engine.push_layer(req_id, layer_idx, _layer_blocks_to_native(blocks))
 
+    def wait_for_pushes(self, req_id: str) -> None:
+        wait_for_pushes = getattr(self.engine, "wait_for_pushes", None)
+        if wait_for_pushes is None:
+            return None
+        return wait_for_pushes(req_id)
+
     def push_done(self, req_id: str) -> None:
         self.engine.push_done(req_id)
 
@@ -224,6 +244,12 @@ class RealRdmaPort:
 
     def pop_finished_recving(self) -> set[str]:
         return set(self.engine.pop_finished_recving())
+
+    def close_request(self, req_id: str) -> None:
+        close_request = getattr(self.engine, "close_request", None)
+        if close_request is None:
+            return None
+        return close_request(req_id)
 
 
 def build_rdma_port(vllm_config: Any, cuda_device: int | None) -> RdmaPort:

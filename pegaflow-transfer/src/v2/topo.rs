@@ -14,7 +14,7 @@ use crate::v2::{
     provider_dispatch::DomainInfo,
     verbs::{VerbsDeviceInfo, VerbsDeviceList},
 };
-use log::warn;
+use log::{info, warn};
 
 #[derive(Clone)]
 pub struct TopologyGroup {
@@ -417,26 +417,53 @@ fn detect_system_topo(
 
     // Count GPUs per NUMA node
     let mut numa_gpu_count = vec![0; numa_cpus.len()];
-    for gpu in all_gpus {
+    for gpu in &all_gpus {
         numa_gpu_count[gpu
             .numa_node
             .expect("GPU without NUMA node should be filtered")] += 1;
     }
 
+    info!(
+        "Topology PCI scan found GPUs={} NICs={} NUMA nodes={}",
+        all_gpus.len(),
+        all_nics.len(),
+        numa_cpus.len()
+    );
+
     // Create topology groups
     let mut system_topo = Vec::new();
     let mut numa_gpu_indices = vec![0; numa_cpus.len()];
     for switch in switch_groups.into_iter() {
-        if switch.nics.is_empty() {
-            continue;
-        }
-        let nics_per_gpu = switch.nics.len() / switch.gpus.len();
+        let nics_per_gpu = if switch.nics.is_empty() {
+            0
+        } else {
+            switch.nics.len() / switch.gpus.len()
+        };
         for (i_gpu, gpu) in switch.gpus.iter().enumerate() {
             let gpu_numa_node = gpu
                 .numa_node
                 .expect("GPU without NUMA node should be filtered");
             // Assign NICs to GPUs
-            let nics = if nics_per_gpu == 0 {
+            let nics = if switch.nics.is_empty() {
+                let same_numa_nics = all_nics
+                    .iter()
+                    .filter(|nic| nic.numa_node == Some(gpu_numa_node))
+                    .map(|nic| (*nic).clone())
+                    .collect::<Vec<_>>();
+                if same_numa_nics.is_empty() {
+                    warn!(
+                        "Skipping GPU PCI device {} because no visible NIC shares NUMA node {}",
+                        gpu.pci_addr, gpu_numa_node
+                    );
+                    continue;
+                }
+                warn!(
+                    "GPU PCI device {} has no NIC under the same PCI switch; using {} same-NUMA NIC(s)",
+                    gpu.pci_addr,
+                    same_numa_nics.len()
+                );
+                same_numa_nics
+            } else if nics_per_gpu == 0 {
                 vec![switch.nics[i_gpu % switch.nics.len()].clone()]
             } else {
                 switch.nics[i_gpu * nics_per_gpu..(i_gpu + 1) * nics_per_gpu]
@@ -503,7 +530,7 @@ fn do_detect_topology() -> Result<Vec<TopologyGroup>> {
     let system_topo = detect_system_topo(gpu_pci_device_id, nic_pci_device_id)?;
 
     // Only keep visible NICs and GPUs (e.g., due to containerization)
-    let mut visible_nics: HashMap<_, _> = domains
+    let visible_nics: HashMap<_, _> = domains
         .iter()
         .map(|info| (PciAddress::from(info), info.clone()))
         .collect();
@@ -521,8 +548,8 @@ fn do_detect_topology() -> Result<Vec<TopologyGroup>> {
 
         let mut domains = Vec::new();
         for nic in &group.nics {
-            if let Some(domain) = visible_nics.remove(&nic.pci_addr) {
-                domains.push(domain);
+            if let Some(domain) = visible_nics.get(&nic.pci_addr) {
+                domains.push(domain.clone());
             }
         }
         if domains.is_empty() {
