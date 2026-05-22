@@ -157,11 +157,21 @@ class PdWorkerConnector:
             self._rdma_waiter.submit(req_id)
             if req.prefill_url:
                 self._pending_worker_handshakes[req_id] = handshake
+                logger.info(
+                    "[PdConnector] D worker handshake ready req=%s remote_req=%s rank=%d blocks=%d layers=%d ts_ns=%d",
+                    req_id,
+                    req.remote_request_id,
+                    self.tp_rank,
+                    len(flatten_block_ids(req.local_block_ids)),
+                    len(handshake.layers),
+                    time.time_ns(),
+                )
             logger.info(
-                "[PdConnector] D queued async wait req=%s remote_req=%s prefill_url=%s",
+                "[PdConnector] D queued async wait req=%s remote_req=%s prefill_url=%s ts_ns=%d",
                 req_id,
                 req.remote_request_id,
                 req.prefill_url or "<oob>",
+                time.time_ns(),
             )
 
         for req_id, dispatch in metadata.prefill_dispatches.items():
@@ -184,14 +194,21 @@ class PdWorkerConnector:
                 req = replace(req, handshake=handshake)
             self._push_reqs[req_id] = req
             trace = self._push_traces.setdefault(req_id, _PushTrace(queued_ts_ns=time.time_ns()))
-            trace.chunk_queued_ts_ns = time.time_ns()
+            queued_ts_ns = time.time_ns()
+            trace.chunk_queued_ts_ns = queued_ts_ns
             self._pending_push_chunks.add(req_id)
             self._push_chunk_maps.pop(req_id, None)
             self.rdma.register_remote(req_id, handshake)
             logger.info(
-                "[PdConnector] P queued async push req=%s target_req=%s",
+                "[PdConnector] P queued async push req=%s target_req=%s rank=%d blocks=%d layers=%d ts_ns=%d",
                 req_id,
                 req.target_request_id,
+                self.tp_rank,
+                len(flatten_block_ids(req.local_block_ids)),
+                len(req.handshakes[0].layers)
+                if req.handshakes
+                else (len(handshake.layers) if handshake else 0),
+                queued_ts_ns,
             )
 
         for req_id in metadata.reqs_to_release:
@@ -307,6 +324,12 @@ class PdWorkerConnector:
             req_id: {handshake.tp_rank: handshake}
             for req_id, handshake in self._pending_worker_handshakes.items()
         }
+        logger.info(
+            "[PdConnector] D worker handshakes exported rank=%d reqs=%s ts_ns=%d",
+            self.tp_rank,
+            sorted(handshakes),
+            time.time_ns(),
+        )
         self._pending_worker_handshakes = {}
         return PdWorkerMetadata(handshakes=handshakes)
 
@@ -441,6 +464,7 @@ class PdWorkerConnector:
                 selected_blocks,
                 remote_block_ids,
             )
+            rdma_bytes = _block_slices_bytes(block_slices)
             self._push_layer_async(
                 req_id,
                 req,
@@ -451,6 +475,8 @@ class PdWorkerConnector:
             submit_ns = time.perf_counter_ns() - submit_start_ns
             trace.kv_submit_ns += submit_ns
             trace.chunk_kv_submit_ns += submit_ns
+            trace.rdma_bytes += rdma_bytes
+            trace.chunk_rdma_bytes += rdma_bytes
             trace.layer_submit_count += 1
             trace.chunk_layer_submit_count += 1
             self._tracker.mark_blocks_pushed(req_id, layer_idx, selected_blocks)
@@ -467,7 +493,7 @@ class PdWorkerConnector:
             )
             if not (chunk_complete and all_chunks_seen):
                 logger.info(
-                    "[PdConnector] P observed prefill chunk req=%s target_req=%s chunk=%d layers=%d blocks=%d all_chunks_seen=%s chunk_forward_ms=%.3f request_forward_ms=%.3f chunk_kv_submit_ms=%.3f request_kv_submit_ms=%.3f chunk_layer_submits=%d request_layer_submits=%d ts_ns=%d",
+                    "[PdConnector] P observed prefill chunk req=%s target_req=%s chunk=%d layers=%d blocks=%d all_chunks_seen=%s chunk_forward_ms=%.3f request_forward_ms=%.3f chunk_kv_submit_ms=%.3f request_kv_submit_ms=%.3f chunk_observed_gbps=%.2f request_observed_gbps=%.2f chunk_layer_submits=%d request_layer_submits=%d ts_ns=%d",
                     req_id,
                     req.target_request_id,
                     trace.chunk_count,
@@ -478,6 +504,10 @@ class PdWorkerConnector:
                     _elapsed_ms(trace.first_save_ts_ns, trace.last_save_ts_ns),
                     trace.chunk_kv_submit_ns / 1_000_000,
                     trace.kv_submit_ns / 1_000_000,
+                    _gbps(
+                        trace.chunk_rdma_bytes, trace.chunk_first_save_ts_ns, trace.last_save_ts_ns
+                    ),
+                    _gbps(trace.rdma_bytes, trace.first_save_ts_ns, trace.last_save_ts_ns),
                     trace.chunk_layer_submit_count,
                     trace.layer_submit_count,
                     trace.last_save_ts_ns,
@@ -487,7 +517,7 @@ class PdWorkerConnector:
             self._tracker.mark_done(req_id)
             finalize_ts_ns = time.time_ns()
             logger.info(
-                "[PdConnector] P observed prefill final chunk req=%s target_req=%s chunks=%d layers=%d blocks=%d schedule_to_last_save_ms=%.3f chunk_forward_ms=%.3f request_forward_ms=%.3f chunk_kv_submit_ms=%.3f request_kv_submit_ms=%.3f chunk_layer_submits=%d request_layer_submits=%d ts_ns=%d",
+                "[PdConnector] P observed prefill final chunk req=%s target_req=%s chunks=%d layers=%d blocks=%d schedule_to_last_save_ms=%.3f chunk_forward_ms=%.3f request_forward_ms=%.3f chunk_kv_submit_ms=%.3f request_kv_submit_ms=%.3f chunk_observed_gbps=%.2f request_observed_gbps=%.2f chunk_layer_submits=%d request_layer_submits=%d ts_ns=%d",
                 req_id,
                 req.target_request_id,
                 trace.chunk_count,
@@ -498,6 +528,8 @@ class PdWorkerConnector:
                 _elapsed_ms(trace.first_save_ts_ns, trace.last_save_ts_ns),
                 trace.chunk_kv_submit_ns / 1_000_000,
                 trace.kv_submit_ns / 1_000_000,
+                _gbps(trace.chunk_rdma_bytes, trace.chunk_first_save_ts_ns, trace.last_save_ts_ns),
+                _gbps(trace.rdma_bytes, trace.first_save_ts_ns, trace.last_save_ts_ns),
                 trace.chunk_layer_submit_count,
                 trace.layer_submit_count,
                 finalize_ts_ns,
@@ -514,6 +546,7 @@ class PdWorkerConnector:
                     last_save_ts_ns=trace.last_save_ts_ns,
                     finalize_queued_ts_ns=finalize_ts_ns,
                     kv_submit_ns=trace.kv_submit_ns,
+                    rdma_bytes=trace.rdma_bytes,
                     layer_submit_count=trace.layer_submit_count,
                 )
             )
@@ -543,6 +576,7 @@ class PdWorkerConnector:
                 layer_idx=layer_idx,
                 block_slices=block_slices,
                 num_blocks=num_blocks,
+                queued_ts_ns=time.time_ns(),
             )
         )
 
@@ -723,6 +757,16 @@ def _elapsed_ms(start_ts_ns: int | None, end_ts_ns: int | None) -> float:
     return (end_ts_ns - start_ts_ns) / 1_000_000
 
 
+def _gbps(bytes_total: int, start_ts_ns: int | None, end_ts_ns: int | None) -> float:
+    if bytes_total <= 0 or start_ts_ns is None or end_ts_ns is None or end_ts_ns <= start_ts_ns:
+        return 0.0
+    return bytes_total * 8 / ((end_ts_ns - start_ts_ns) / 1_000_000_000) / 1e9
+
+
+def _block_slices_bytes(block_slices: list[LayerBlockSlices]) -> int:
+    return sum(block.k.bytes + block.v.bytes for block in block_slices)
+
+
 @dataclass(frozen=True)
 class _LayerPushTask:
     rdma: RdmaPort
@@ -731,6 +775,7 @@ class _LayerPushTask:
     layer_idx: int
     block_slices: list[LayerBlockSlices]
     num_blocks: int
+    queued_ts_ns: int
 
 
 @dataclass
@@ -742,6 +787,8 @@ class _PushTrace:
     last_save_ts_ns: int | None = None
     kv_submit_ns: int = 0
     chunk_kv_submit_ns: int = 0
+    rdma_bytes: int = 0
+    chunk_rdma_bytes: int = 0
     layer_submit_count: int = 0
     chunk_layer_submit_count: int = 0
     chunk_count: int = 0
@@ -750,6 +797,7 @@ class _PushTrace:
         self.chunk_queued_ts_ns = None
         self.chunk_first_save_ts_ns = None
         self.chunk_kv_submit_ns = 0
+        self.chunk_rdma_bytes = 0
         self.chunk_layer_submit_count = 0
 
 
@@ -765,6 +813,7 @@ class _PushFinalizeTask:
     last_save_ts_ns: int | None
     finalize_queued_ts_ns: int
     kv_submit_ns: int
+    rdma_bytes: int
     layer_submit_count: int
 
 
@@ -832,21 +881,26 @@ class _AsyncLayerPushSender:
 
 
 def _run_layer_push(task: _LayerPushTask) -> None:
-    bytes_total = sum(block.k.bytes + block.v.bytes for block in task.block_slices)
+    bytes_total = _block_slices_bytes(task.block_slices)
+    start_ts_ns = time.time_ns()
     start = time.perf_counter()
     task.rdma.push_layer(task.req_id, task.layer_idx, task.block_slices)
     elapsed_s = time.perf_counter() - start
+    done_ts_ns = time.time_ns()
     bandwidth_gbps = (bytes_total * 8 / elapsed_s / 1e9) if elapsed_s > 0 else 0.0
     logger.info(
-        "[PdConnector] P RDMA push req=%s target_req=%s layer=%d blocks=%d ranges=%d bytes=%d latency_ms=%.3f bandwidth_gbps=%.2f",
+        "[PdConnector] P RDMA push req=%s target_req=%s layer=%d blocks=%d ranges=%d bytes=%d queue_wait_ms=%.3f latency_ms=%.3f submit_to_done_ms=%.3f bandwidth_gbps=%.2f ts_ns=%d",
         task.req_id,
         task.target_request_id,
         task.layer_idx,
         task.num_blocks,
         len(task.block_slices),
         bytes_total,
+        _elapsed_ms(task.queued_ts_ns, start_ts_ns),
         elapsed_s * 1000,
+        _elapsed_ms(task.queued_ts_ns, done_ts_ns),
         bandwidth_gbps,
+        done_ts_ns,
     )
 
 
@@ -898,18 +952,21 @@ class _AsyncPushFinalizer:
                 done_ts_ns = time.time_ns()
                 elapsed_s = time.perf_counter() - start
                 logger.info(
-                    "[PdConnector] P finished RDMA push req=%s target_req=%s chunks=%d layers=%d blocks=%d finalize_ms=%.3f finalize_queued_to_imm_ms=%.3f observed_forward_ms=%.3f kv_submit_ms=%.3f last_save_to_imm_ms=%.3f first_save_to_imm_ms=%.3f layer_submits=%d source=finalizer ts_ns=%d",
+                    "[PdConnector] P finished RDMA push req=%s target_req=%s chunks=%d layers=%d blocks=%d rdma_bytes=%d finalize_ms=%.3f finalize_queued_to_imm_ms=%.3f observed_forward_ms=%.3f kv_submit_ms=%.3f last_save_to_imm_ms=%.3f first_save_to_imm_ms=%.3f last_save_to_imm_gbps=%.2f first_save_to_imm_gbps=%.2f layer_submits=%d source=finalizer ts_ns=%d",
                     task.req_id,
                     task.target_request_id,
                     task.chunk_count,
                     task.num_layers,
                     task.num_blocks,
+                    task.rdma_bytes,
                     elapsed_s * 1000,
                     _elapsed_ms(task.finalize_queued_ts_ns, done_ts_ns),
                     _elapsed_ms(task.first_save_ts_ns, task.last_save_ts_ns),
                     task.kv_submit_ns / 1_000_000,
                     _elapsed_ms(task.last_save_ts_ns, done_ts_ns),
                     _elapsed_ms(task.first_save_ts_ns, done_ts_ns),
+                    _gbps(task.rdma_bytes, task.last_save_ts_ns, done_ts_ns),
+                    _gbps(task.rdma_bytes, task.first_save_ts_ns, done_ts_ns),
                     task.layer_submit_count,
                     done_ts_ns,
                 )

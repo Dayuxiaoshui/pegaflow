@@ -153,6 +153,7 @@ class PdSchedulerConnector:
             return
 
         if params.get("do_remote_prefill_sender") or params.get("pd_push_producer"):
+            now_ns = time.time_ns()
             push_req = PushReqMeta(
                 local_block_ids=local_block_ids,
                 target=RemoteEndpoint(
@@ -172,10 +173,15 @@ class PdSchedulerConnector:
             self._active_push_meta[req_id] = push_req
             self._pending_producer_reqs.add(req_id)
             logger.info(
-                "[PdConnector] scheduler push req=%s blocks=%d target_req=%s",
+                "[PdConnector] scheduler push req=%s blocks=%d target_req=%s prompt_tokens=%d handshakes=%d ts_ns=%d",
                 req_id,
                 _count(local_block_ids),
                 self._reqs_to_push[req_id].target_request_id,
+                push_req.num_prompt_tokens,
+                len(push_req.handshakes)
+                if push_req.handshakes
+                else int(push_req.handshake is not None),
+                now_ns,
             )
 
     def build_connector_meta(self, scheduler_output: Any) -> PdConnectorMetadata:
@@ -292,10 +298,11 @@ class PdSchedulerConnector:
             self._reqs_to_push[req_id] = replace(push_req, local_block_ids=local_block_ids)
             self._pending_producer_reqs.add(req_id)
             logger.info(
-                "[PdConnector] scheduler push cached req=%s blocks=%d target_req=%s",
+                "[PdConnector] scheduler push cached req=%s blocks=%d target_req=%s ts_ns=%d",
                 req_id,
                 _count(local_block_ids),
                 push_req.target_request_id,
+                time.time_ns(),
             )
 
     def _ingest_worker_handshakes(self, worker_meta: PdWorkerMetadata) -> None:
@@ -308,10 +315,11 @@ class PdSchedulerConnector:
             expected = next(iter(merged.values())).tp_size if merged else 1
             if len(merged) < expected:
                 logger.info(
-                    "[PdConnector] scheduler collected handshakes req=%s ranks=%s/%d",
+                    "[PdConnector] scheduler collected handshakes req=%s ranks=%s/%d ts_ns=%d",
                     req_id,
                     sorted(merged),
                     expected,
+                    time.time_ns(),
                 )
                 continue
             if req_id in self._prefill_dispatches or req_id in self._dispatched_prefills:
