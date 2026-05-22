@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from pegaflow.pd_connector.metadata import LayerRemoteLayout
+from pegaflow.pd_connector.metadata import LayerRemoteLayout, LinearBlockAddrLayout
 
 
 @dataclass(frozen=True)
@@ -122,6 +122,7 @@ class FlashAttnHndLayout:
         if block_ids is None:
             block_ids = set(range(self.num_blocks))
         ordered = tuple(sorted(block_ids))
+        linear = self._linear_block_addr_layout(ordered)
         return LayerRemoteLayout(
             layer_name=self.layer_name,
             layer_idx=layer_idx,
@@ -134,6 +135,26 @@ class FlashAttnHndLayout:
             v_block_addrs=tuple(
                 self.base_addr + self.block_offset_bytes(1, block_id) for block_id in ordered
             ),
+            linear=linear,
+        )
+
+    def _linear_block_addr_layout(
+        self,
+        ordered_block_ids: tuple[int, ...],
+    ) -> LinearBlockAddrLayout | None:
+        if not ordered_block_ids:
+            return None
+        block_id_stride = _constant_stride(ordered_block_ids)
+        if block_id_stride is None:
+            return None
+        addr_stride = block_id_stride * self.block_bytes
+        return LinearBlockAddrLayout(
+            block_id_start=ordered_block_ids[0],
+            block_id_stride=block_id_stride,
+            num_blocks=len(ordered_block_ids),
+            k_addr_start=self.base_addr + self.block_offset_bytes(0, ordered_block_ids[0]),
+            v_addr_start=self.base_addr + self.block_offset_bytes(1, ordered_block_ids[0]),
+            addr_stride=addr_stride,
         )
 
 
@@ -145,3 +166,13 @@ def unique_blocks_from_slot_mapping(slot_mapping: Any, block_size: int) -> set[i
         slot_mapping = slot_mapping.cpu()
     slots = slot_mapping.tolist() if hasattr(slot_mapping, "tolist") else list(slot_mapping)
     return {int(slot) // block_size for slot in slots if int(slot) >= 0}
+
+
+def _constant_stride(values: tuple[int, ...]) -> int | None:
+    if len(values) <= 1:
+        return 1
+    stride = values[1] - values[0]
+    for prev, current in zip(values[:-1], values[1:], strict=True):
+        if current - prev != stride:
+            return None
+    return stride

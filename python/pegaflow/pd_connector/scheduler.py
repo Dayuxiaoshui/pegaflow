@@ -314,7 +314,6 @@ class PdSchedulerConnector:
                     expected,
                 )
                 continue
-            now_ns = time.time_ns()
             if req_id in self._prefill_dispatches or req_id in self._dispatched_prefills:
                 continue
             handshakes = tuple(merged[rank] for rank in sorted(merged))
@@ -329,16 +328,21 @@ class PdSchedulerConnector:
                 handshakes=handshakes,
             )
             self._dispatched_prefills.add(req_id)
-            self._prefill_sender.submit(prefill_task_from_dispatch(dispatch))
+            serialize_start_ns = time.time_ns()
+            task = prefill_task_from_dispatch(dispatch)
+            serialize_done_ns = time.time_ns()
+            self._prefill_sender.submit(task)
+            submit_ts_ns = time.time_ns()
             alloc_ts_ns = self._wait_alloc_ts_ns.get(req_id)
-            dispatch_ms = _elapsed_ms(alloc_ts_ns, now_ns)
+            dispatch_ms = _elapsed_ms(alloc_ts_ns, submit_ts_ns)
             logger.info(
-                "[PdConnector] scheduler submitted prefill dispatch req=%s remote_req=%s ranks=%s dispatch_ms=%s ts_ns=%d",
+                "[PdConnector] scheduler submitted prefill dispatch req=%s remote_req=%s ranks=%s dispatch_ms=%s serialize_ms=%.3f ts_ns=%d",
                 req_id,
                 wait_req.remote_request_id,
                 [handshake.tp_rank for handshake in handshakes],
                 _fmt_ms(dispatch_ms),
-                now_ns,
+                (serialize_done_ns - serialize_start_ns) / 1_000_000,
+                submit_ts_ns,
             )
 
     def shutdown(self) -> None:

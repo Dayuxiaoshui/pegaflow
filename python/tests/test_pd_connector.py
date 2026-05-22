@@ -31,6 +31,7 @@ from pegaflow.pd_connector.layout import (  # noqa: E402
 )
 from pegaflow.pd_connector.metadata import (  # noqa: E402
     LayerRemoteLayout,
+    LinearBlockAddrLayout,
     PdConnectorMetadata,
     PdHandshake,
     PdWorkerMetadata,
@@ -228,6 +229,14 @@ def test_real_rdma_port_preserves_native_contract_for_pd_push() -> None:
         block_ids=(0, 1),
         k_block_addrs=(0x1000, 0x1400),
         v_block_addrs=(0x1800, 0x1C00),
+        linear=LinearBlockAddrLayout(
+            block_id_start=0,
+            block_id_stride=1,
+            num_blocks=2,
+            k_addr_start=0x1000,
+            v_addr_start=0x1800,
+            addr_stride=0x400,
+        ),
     )
 
     registered = rdma.register_local_layers((layer,))
@@ -239,6 +248,7 @@ def test_real_rdma_port_preserves_native_contract_for_pd_push() -> None:
     assert registered[0].block_ids == (0, 1)
     assert registered[0].k_block_addrs == (0x1000, 0x1400)
     assert registered[0].v_block_addrs == (0x1800, 0x1C00)
+    assert registered[0].linear == layer.linear
 
     handshake = PdHandshake(
         request_id="req-1",

@@ -71,6 +71,16 @@ class PushReqMeta:
 
 
 @dataclass(frozen=True)
+class LinearBlockAddrLayout:
+    block_id_start: int
+    block_id_stride: int
+    num_blocks: int
+    k_addr_start: int
+    v_addr_start: int
+    addr_stride: int
+
+
+@dataclass(frozen=True)
 class LayerRemoteLayout:
     layer_name: str
     layer_idx: int
@@ -80,6 +90,7 @@ class LayerRemoteLayout:
     k_block_addrs: tuple[int, ...]
     v_block_addrs: tuple[int, ...]
     mr_desc: Any | None = None
+    linear: LinearBlockAddrLayout | None = None
 
 
 @dataclass(frozen=True)
@@ -120,6 +131,14 @@ def layer_layout_from_dict(data: dict[str, Any]) -> LayerRemoteLayout:
         block_id_start = int(data["block_id_start"])
         block_id_stride = int(data.get("block_id_stride", 1))
         addr_stride = int(data["addr_stride"])
+        linear = LinearBlockAddrLayout(
+            block_id_start=block_id_start,
+            block_id_stride=block_id_stride,
+            num_blocks=num_blocks,
+            k_addr_start=int(data["k_addr_start"]),
+            v_addr_start=int(data["v_addr_start"]),
+            addr_stride=addr_stride,
+        )
         block_ids = tuple(block_id_start + idx * block_id_stride for idx in range(num_blocks))
         k_block_addrs = tuple(
             int(data["k_addr_start"]) + idx * addr_stride for idx in range(num_blocks)
@@ -128,6 +147,7 @@ def layer_layout_from_dict(data: dict[str, Any]) -> LayerRemoteLayout:
             int(data["v_addr_start"]) + idx * addr_stride for idx in range(num_blocks)
         )
     else:
+        linear = None
         block_ids = tuple(int(block_id) for block_id in data["block_ids"])
         k_block_addrs = tuple(int(addr) for addr in data["k_block_addrs"])
         v_block_addrs = tuple(int(addr) for addr in data["v_block_addrs"])
@@ -140,6 +160,7 @@ def layer_layout_from_dict(data: dict[str, Any]) -> LayerRemoteLayout:
         k_block_addrs=k_block_addrs,
         v_block_addrs=v_block_addrs,
         mr_desc=data.get("mr_desc"),
+        linear=linear,
     )
 
 
@@ -175,7 +196,7 @@ def layer_layout_to_dict(layer: LayerRemoteLayout) -> dict[str, Any]:
         "block_bytes": layer.block_bytes,
         "mr_desc": layer.mr_desc,
     }
-    compact = _linear_layer_layout(layer)
+    compact = _linear_layer_layout_to_dict(layer)
     if compact is not None:
         return {**common, **compact}
     return {
@@ -186,7 +207,17 @@ def layer_layout_to_dict(layer: LayerRemoteLayout) -> dict[str, Any]:
     }
 
 
-def _linear_layer_layout(layer: LayerRemoteLayout) -> dict[str, Any] | None:
+def _linear_layer_layout_to_dict(layer: LayerRemoteLayout) -> dict[str, Any] | None:
+    if layer.linear is not None:
+        return {
+            "block_addr_format": "linear",
+            "block_id_start": layer.linear.block_id_start,
+            "block_id_stride": layer.linear.block_id_stride,
+            "num_blocks": layer.linear.num_blocks,
+            "k_addr_start": layer.linear.k_addr_start,
+            "v_addr_start": layer.linear.v_addr_start,
+            "addr_stride": layer.linear.addr_stride,
+        }
     num_blocks = len(layer.block_ids)
     if num_blocks == 0:
         return None

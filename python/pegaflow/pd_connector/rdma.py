@@ -9,6 +9,7 @@ from pegaflow.logging_utils import get_connector_logger
 from pegaflow.pd_connector.layout import BlockSlice, LayerBlockSlices
 from pegaflow.pd_connector.metadata import (
     LayerRemoteLayout,
+    LinearBlockAddrLayout,
     PdHandshake,
     handshake_to_dict,
 )
@@ -181,7 +182,11 @@ def _layer_to_native(layer: LayerRemoteLayout) -> dict[str, Any]:
     }
 
 
-def _layer_from_native(layer: LayerRemoteLayout | dict[str, Any]) -> LayerRemoteLayout:
+def _layer_from_native(
+    layer: LayerRemoteLayout | dict[str, Any],
+    *,
+    linear: LinearBlockAddrLayout | None = None,
+) -> LayerRemoteLayout:
     if isinstance(layer, LayerRemoteLayout):
         return layer
     block_ids = tuple(int(block_id) for block_id in layer["block_ids"])
@@ -199,6 +204,7 @@ def _layer_from_native(layer: LayerRemoteLayout | dict[str, Any]) -> LayerRemote
         k_block_addrs=k_block_addrs,
         v_block_addrs=v_block_addrs,
         mr_desc=layer.get("mr_desc"),
+        linear=linear,
     )
 
 
@@ -239,7 +245,10 @@ class RealRdmaPort:
     ) -> tuple[LayerRemoteLayout, ...]:
         native_layers = [_layer_to_native(layer) for layer in layers]
         registered = self.engine.register_local_layers(native_layers)
-        return tuple(_layer_from_native(layer) for layer in registered)
+        return tuple(
+            _layer_from_native(layer, linear=original.linear)
+            for original, layer in zip(layers, registered, strict=True)
+        )
 
     def register_remote(self, req_id: str, handshake: PdHandshake | None = None) -> None:
         self.engine.register_remote(req_id, _handshake_to_native(handshake))
