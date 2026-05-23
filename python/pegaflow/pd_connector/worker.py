@@ -28,6 +28,8 @@ from pegaflow.pd_connector.metadata import (
     PdHandshake,
     PdPrefillRequest,
     PdWorkerMetadata,
+    PeerLayerMr,
+    PeerMrRegistration,
     PushReqMeta,
     WaitReqMeta,
     flatten_block_ids,
@@ -83,6 +85,8 @@ class PdWorkerConnector:
         self._slot_mapping_block_cache: OrderedDict[tuple[Any, ...], set[int]] = OrderedDict()
         self._forward_step_id = 0
         self._next_imm_id = 1
+        self._mr_registration: PeerMrRegistration | None = None
+        self._mr_registration_exported = False
         self._push_sender = _AsyncLayerPushSender()
         self._push_finalizer = _AsyncPushFinalizer(self._push_sender)
         self._rdma_waiter = _AsyncRdmaDoneWaiter(self.rdma) if self.rdma is not None else None
@@ -109,6 +113,7 @@ class PdWorkerConnector:
             )
         )
         self._registered_layers = {layer.layer_name: layer for layer in registered_layers}
+        self._mr_registration = self._build_mr_registration()
         logger.info(
             "[PdConnector] registered %d FlashAttention HND KV cache layers",
             len(self.layouts),
@@ -318,20 +323,31 @@ class PdWorkerConnector:
         return failed
 
     def build_connector_worker_meta(self) -> PdWorkerMetadata | None:
-        if not self._pending_worker_handshakes:
+        mr_registrations: dict[int, PeerMrRegistration] = {}
+        if self._mr_registration is not None and not self._mr_registration_exported:
+            mr_registrations[self.tp_rank] = self._mr_registration
+            self._mr_registration_exported = True
+            logger.info(
+                "[PdConnector] D worker MR registration exported rank=%d layers=%d ts_ns=%d",
+                self.tp_rank,
+                len(self._mr_registration.layers),
+                time.time_ns(),
+            )
+        if not self._pending_worker_handshakes and not mr_registrations:
             return None
         handshakes = {
             req_id: {handshake.tp_rank: handshake}
             for req_id, handshake in self._pending_worker_handshakes.items()
         }
-        logger.info(
-            "[PdConnector] D worker handshakes exported rank=%d reqs=%s ts_ns=%d",
-            self.tp_rank,
-            sorted(handshakes),
-            time.time_ns(),
-        )
+        if handshakes:
+            logger.info(
+                "[PdConnector] D worker handshakes exported rank=%d reqs=%s ts_ns=%d",
+                self.tp_rank,
+                sorted(handshakes),
+                time.time_ns(),
+            )
         self._pending_worker_handshakes = {}
-        return PdWorkerMetadata(handshakes=handshakes)
+        return PdWorkerMetadata(handshakes=handshakes, mr_registrations=mr_registrations)
 
     def shutdown(self) -> None:
         self._wait_reqs.clear()
@@ -401,6 +417,32 @@ class PdWorkerConnector:
                 for layer_idx, layer_name in enumerate(self.layer_names)
             ),
             imm_id=imm_id,
+        )
+
+    def _build_mr_registration(self) -> PeerMrRegistration:
+        first_layout = next(iter(self.layouts.values()))
+        layers: list[PeerLayerMr] = []
+        for layer_idx, layer_name in enumerate(self.layer_names):
+            layout = self.layouts[layer_name]
+            registered = self._registered_layers.get(layer_name)
+            layers.append(
+                PeerLayerMr(
+                    layer_name=layout.layer_name,
+                    layer_idx=layer_idx,
+                    base_addr=layout.base_addr,
+                    kv_stride_bytes=layout.strides[0] * layout.element_size,
+                    block_stride_bytes=layout.strides[1] * layout.element_size,
+                    block_bytes=layout.block_bytes,
+                    mr_desc=registered.mr_desc if registered is not None else None,
+                )
+            )
+        return PeerMrRegistration(
+            engine_id=self.engine_id,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            block_size=first_layout.block_size,
+            kv_layout="HND",
+            layers=tuple(layers),
         )
 
     def _alloc_imm_id(self) -> int:

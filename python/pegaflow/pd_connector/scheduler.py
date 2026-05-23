@@ -10,6 +10,7 @@ from pegaflow.logging_utils import get_connector_logger
 from pegaflow.pd_connector.metadata import (
     PdConnectorMetadata,
     PdWorkerMetadata,
+    PeerMrRegistration,
     PrefillDispatch,
     PushReqMeta,
     RemoteEndpoint,
@@ -59,6 +60,9 @@ class PdSchedulerConnector:
         self._active_push_meta: dict[str, PushReqMeta] = {}
         self._wait_alloc_ts_ns: dict[str, int] = {}
         self._wait_finished_ts_ns: dict[str, int] = {}
+        self._peer_mr_cache: dict[int, PeerMrRegistration] = {}
+        self._peer_mr_tp_size: int | None = None
+        self._next_imm_id = 1
         self._prefill_sender = prefill_sender or AsyncPrefillSender()
 
     def get_num_new_matched_tokens(
@@ -139,8 +143,9 @@ class PdSchedulerConnector:
             self._reqs_to_wait[req_id] = wait_req
             self._active_wait_meta[req_id] = wait_req
             self._wait_alloc_ts_ns[req_id] = now_ns
+            dispatched = self._try_immediate_dispatch(req_id, wait_req)
             logger.info(
-                "[PdConnector] scheduler wait req=%s blocks=%d remote_req=%s done_req=%s prefill_url=%s prompt_tokens=%d external_tokens=%d ts_ns=%d",
+                "[PdConnector] scheduler wait req=%s blocks=%d remote_req=%s done_req=%s prefill_url=%s prompt_tokens=%d external_tokens=%d immediate=%s ts_ns=%d",
                 req_id,
                 _count(local_block_ids),
                 self._reqs_to_wait[req_id].remote_request_id,
@@ -148,6 +153,7 @@ class PdSchedulerConnector:
                 self._reqs_to_wait[req_id].prefill_url or "<oob>",
                 wait_req.num_prompt_tokens,
                 num_external_tokens,
+                dispatched,
                 now_ns,
             )
             return
@@ -239,6 +245,7 @@ class PdSchedulerConnector:
             )
         worker_meta = getattr(connector_output, "kv_connector_worker_meta", None)
         if isinstance(worker_meta, PdWorkerMetadata):
+            self._ingest_mr_registrations(worker_meta)
             self._ingest_worker_handshakes(worker_meta)
         logger.debug(
             "[PdConnector] scheduler update_connector_output after_active=%s after_completed=%s after_pending=%s",
@@ -304,6 +311,86 @@ class PdSchedulerConnector:
                 push_req.target_request_id,
                 time.time_ns(),
             )
+
+    def _ingest_mr_registrations(self, worker_meta: PdWorkerMetadata) -> None:
+        if not worker_meta.mr_registrations:
+            return
+        for rank, reg in worker_meta.mr_registrations.items():
+            if rank not in self._peer_mr_cache:
+                self._peer_mr_cache[rank] = reg
+                self._peer_mr_tp_size = reg.tp_size
+                logger.info(
+                    "[PdConnector] scheduler cached MR registration rank=%d layers=%d ts_ns=%d",
+                    rank,
+                    len(reg.layers),
+                    time.time_ns(),
+                )
+        if self._mr_cache_ready():
+            self._dispatch_pending_waits()
+
+    def _mr_cache_ready(self) -> bool:
+        if self._peer_mr_tp_size is None:
+            return False
+        return len(self._peer_mr_cache) >= self._peer_mr_tp_size
+
+    def _alloc_imm_id(self) -> int:
+        imm_id = self._next_imm_id
+        self._next_imm_id += 1
+        if self._next_imm_id > 0xFFFF_FFFF:
+            self._next_imm_id = 1
+        return imm_id
+
+    def _try_immediate_dispatch(self, req_id: str, wait_req: WaitReqMeta) -> bool:
+        """Dispatch prefill immediately using cached MR info. Returns True if dispatched."""
+        if not wait_req.prefill_url or not self._mr_cache_ready():
+            return False
+        block_ids = tuple(
+            sorted(block_id for group in wait_req.local_block_ids for block_id in group)
+        )
+        handshakes = tuple(
+            self._peer_mr_cache[rank].build_handshake(
+                request_id=wait_req.done_request_id,
+                block_ids=block_ids,
+                imm_id=self._alloc_imm_id(),
+            )
+            for rank in sorted(self._peer_mr_cache)
+        )
+        dispatch = PrefillDispatch(
+            request_id=wait_req.remote_request_id,
+            prefill_url=wait_req.prefill_url,
+            model=wait_req.model,
+            prompt_token_ids=wait_req.prompt_token_ids,
+            max_tokens=wait_req.prefill_max_tokens,
+            target_engine_id=self.engine_id,
+            target_request_id=wait_req.done_request_id,
+            handshakes=handshakes,
+        )
+        self._dispatched_prefills.add(req_id)
+        task = prefill_task_from_dispatch(dispatch)
+        self._prefill_sender.submit(task)
+        submit_ts_ns = time.time_ns()
+        alloc_ts_ns = self._wait_alloc_ts_ns.get(req_id)
+        dispatch_ms = _elapsed_ms(alloc_ts_ns, submit_ts_ns)
+        logger.info(
+            "[PdConnector] scheduler immediate dispatch req=%s remote_req=%s ranks=%d blocks=%d dispatch_ms=%s ts_ns=%d",
+            req_id,
+            wait_req.remote_request_id,
+            len(handshakes),
+            len(block_ids),
+            _fmt_ms(dispatch_ms),
+            submit_ts_ns,
+        )
+        return True
+
+    def _dispatch_pending_waits(self) -> None:
+        """Dispatch any pending wait requests that couldn't be dispatched immediately."""
+        for req_id in list(self._active_wait_reqs):
+            if req_id in self._dispatched_prefills:
+                continue
+            wait_req = self._active_wait_meta.get(req_id)
+            if wait_req is None:
+                continue
+            self._try_immediate_dispatch(req_id, wait_req)
 
     def _ingest_worker_handshakes(self, worker_meta: PdWorkerMetadata) -> None:
         for req_id, by_rank in worker_meta.handshakes.items():

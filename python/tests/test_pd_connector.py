@@ -35,6 +35,8 @@ from pegaflow.pd_connector.metadata import (  # noqa: E402
     PdConnectorMetadata,
     PdHandshake,
     PdWorkerMetadata,
+    PeerLayerMr,
+    PeerMrRegistration,
     PrefillDispatch,
     PushReqMeta,
     RemoteEndpoint,
@@ -1474,3 +1476,150 @@ def test_pd_proxy_preserves_streaming_decode_request() -> None:
 
 def test_pd_connector_requires_piecewise_cudagraph_for_layer_push() -> None:
     assert PdConnector.requires_piecewise_for_cudagraph({}) is True
+
+
+def test_scheduler_immediate_dispatch_with_cached_mr() -> None:
+    """When MR registrations are cached, scheduler dispatches immediately
+    in update_state_after_alloc without waiting for worker handshake fan-in."""
+    prefill_sender = FakePrefillSender()
+    scheduler = PdSchedulerConnector(
+        SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="decode")),
+        prefill_sender=prefill_sender,
+    )
+
+    # Simulate workers exporting MR registration (happens once after register_kv_caches)
+    mr_reg_rank0 = PeerMrRegistration(
+        engine_id="decode",
+        tp_rank=0,
+        tp_size=2,
+        block_size=16,
+        kv_layout="HND",
+        layers=(
+            PeerLayerMr(
+                layer_name="layer.0",
+                layer_idx=0,
+                base_addr=0x1000_0000,
+                kv_stride_bytes=8 * 16 * 4 * 32 * 2,  # kv_idx stride
+                block_stride_bytes=16 * 4 * 32 * 2,  # block stride
+                block_bytes=16 * 4 * 32 * 2,
+                mr_desc={"rkey": 100},
+            ),
+        ),
+    )
+    mr_reg_rank1 = PeerMrRegistration(
+        engine_id="decode",
+        tp_rank=1,
+        tp_size=2,
+        block_size=16,
+        kv_layout="HND",
+        layers=(
+            PeerLayerMr(
+                layer_name="layer.0",
+                layer_idx=0,
+                base_addr=0x2000_0000,
+                kv_stride_bytes=8 * 16 * 4 * 32 * 2,
+                block_stride_bytes=16 * 4 * 32 * 2,
+                block_bytes=16 * 4 * 32 * 2,
+                mr_desc={"rkey": 200},
+            ),
+        ),
+    )
+
+    # Workers report MR info (one-time, during warmup steps)
+    scheduler.update_connector_output(
+        SimpleNamespace(
+            finished_sending=None,
+            finished_recving=None,
+            kv_connector_worker_meta=PdWorkerMetadata(
+                mr_registrations={0: mr_reg_rank0, 1: mr_reg_rank1},
+            ),
+        )
+    )
+    assert len(prefill_sender.tasks) == 0
+
+    # Now a real request arrives — should dispatch immediately
+    request = SimpleNamespace(
+        request_id="req-1",
+        num_prompt_tokens=3,
+        prompt_token_ids=[11, 12, 13],
+        kv_transfer_params={
+            "do_remote_prefill": True,
+            "remote_engine_id": "prefill",
+            "remote_request_id": "prefill-req-1",
+            "done_request_id": "done-req-1",
+            "prefill_url": "http://127.0.0.1:8001",
+            "prefill_max_tokens": 1,
+            "model": "/data/Qwen3-4B",
+        },
+    )
+    scheduler.update_state_after_alloc(request, ([1, 3],), num_external_tokens=3)
+
+    # Dispatch should have happened immediately — no need for worker fan-in
+    assert len(prefill_sender.tasks) == 1
+    task = prefill_sender.tasks[0]
+    assert task.request_id == "prefill-req-1"
+    handshakes = task.kv_transfer_params["pd_handshakes"]
+    assert len(handshakes) == 2
+    assert handshakes[0]["tp_rank"] == 0
+    assert handshakes[1]["tp_rank"] == 1
+    assert handshakes[0]["layers"][0]["mr_desc"] == {"rkey": 100}
+    assert handshakes[1]["layers"][0]["mr_desc"] == {"rkey": 200}
+    # Linear format: num_blocks instead of explicit block_ids list
+    assert handshakes[0]["layers"][0]["num_blocks"] == 2
+
+
+def test_scheduler_falls_back_to_fanin_without_mr_cache() -> None:
+    """Without cached MR registrations, scheduler falls back to worker fan-in."""
+    prefill_sender = FakePrefillSender()
+    scheduler = PdSchedulerConnector(
+        SimpleNamespace(kv_transfer_config=SimpleNamespace(engine_id="decode")),
+        prefill_sender=prefill_sender,
+    )
+
+    request = SimpleNamespace(
+        request_id="req-1",
+        num_prompt_tokens=3,
+        prompt_token_ids=[11, 12, 13],
+        kv_transfer_params={
+            "do_remote_prefill": True,
+            "remote_engine_id": "prefill",
+            "remote_request_id": "prefill-req-1",
+            "done_request_id": "done-req-1",
+            "prefill_url": "http://127.0.0.1:8001",
+            "prefill_max_tokens": 1,
+        },
+    )
+    scheduler.update_state_after_alloc(request, ([1],), num_external_tokens=3)
+
+    # No MR cache → no immediate dispatch
+    assert len(prefill_sender.tasks) == 0
+
+
+def test_peer_mr_registration_builds_handshake_with_correct_addrs() -> None:
+    """PeerMrRegistration.build_handshake computes K/V addresses from layout."""
+    reg = PeerMrRegistration(
+        engine_id="decode",
+        tp_rank=0,
+        tp_size=1,
+        block_size=16,
+        kv_layout="HND",
+        layers=(
+            PeerLayerMr(
+                layer_name="layer.0",
+                layer_idx=0,
+                base_addr=0x1000,
+                kv_stride_bytes=0x800,  # K/V stride
+                block_stride_bytes=0x100,  # block stride
+                block_bytes=0x100,
+            ),
+        ),
+    )
+    handshake = reg.build_handshake("req-1", (2, 5), imm_id=42)
+    assert handshake.request_id == "req-1"
+    assert handshake.imm_id == 42
+    layer = handshake.layers[0]
+    assert layer.block_ids == (2, 5)
+    # K addrs: base + block_id * block_stride
+    assert layer.k_block_addrs == (0x1000 + 2 * 0x100, 0x1000 + 5 * 0x100)
+    # V addrs: base + kv_stride + block_id * block_stride
+    assert layer.v_block_addrs == (0x1000 + 0x800 + 2 * 0x100, 0x1000 + 0x800 + 5 * 0x100)

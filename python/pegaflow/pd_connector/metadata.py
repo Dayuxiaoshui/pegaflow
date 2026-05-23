@@ -290,16 +290,79 @@ class PdConnectorMetadata(KVConnectorMetadata):
         )
 
 
+@dataclass(frozen=True)
+class PeerLayerMr:
+    """Static per-layer MR info, fixed after register_kv_caches."""
+
+    layer_name: str
+    layer_idx: int
+    base_addr: int
+    kv_stride_bytes: int
+    block_stride_bytes: int
+    block_bytes: int
+    mr_desc: Any | None = None
+
+    def k_block_addr(self, block_id: int) -> int:
+        return self.base_addr + block_id * self.block_stride_bytes
+
+    def v_block_addr(self, block_id: int) -> int:
+        return self.base_addr + self.kv_stride_bytes + block_id * self.block_stride_bytes
+
+
+@dataclass(frozen=True)
+class PeerMrRegistration:
+    """Per-rank static MR registration, exported once after register_kv_caches."""
+
+    engine_id: str
+    tp_rank: int
+    tp_size: int
+    block_size: int
+    kv_layout: str
+    layers: tuple[PeerLayerMr, ...]
+
+    def build_handshake(
+        self,
+        request_id: str,
+        block_ids: tuple[int, ...],
+        imm_id: int | None = None,
+    ) -> PdHandshake:
+        return PdHandshake(
+            request_id=request_id,
+            engine_id=self.engine_id,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            block_size=self.block_size,
+            kv_layout=self.kv_layout,
+            layers=tuple(
+                LayerRemoteLayout(
+                    layer_name=layer.layer_name,
+                    layer_idx=layer.layer_idx,
+                    base_addr=layer.base_addr,
+                    block_bytes=layer.block_bytes,
+                    block_ids=block_ids,
+                    k_block_addrs=tuple(layer.k_block_addr(b) for b in block_ids),
+                    v_block_addrs=tuple(layer.v_block_addr(b) for b in block_ids),
+                    mr_desc=layer.mr_desc,
+                )
+                for layer in self.layers
+            ),
+            imm_id=imm_id,
+        )
+
+
 @dataclass
 class PdWorkerMetadata(KVConnectorWorkerMetadata):
     handshakes: dict[str, dict[int, PdHandshake]] = field(default_factory=dict)
+    mr_registrations: dict[int, PeerMrRegistration] = field(default_factory=dict)
 
     def aggregate(self, other: KVConnectorWorkerMetadata) -> KVConnectorWorkerMetadata:
         assert isinstance(other, PdWorkerMetadata)
         merged = {req_id: dict(by_rank) for req_id, by_rank in self.handshakes.items()}
         for req_id, by_rank in other.handshakes.items():
             merged.setdefault(req_id, {}).update(by_rank)
-        return PdWorkerMetadata(handshakes=merged)
+        merged_mr = dict(self.mr_registrations)
+        merged_mr.update(other.mr_registrations)
+        return PdWorkerMetadata(handshakes=merged, mr_registrations=merged_mr)
 
 
 @dataclass
