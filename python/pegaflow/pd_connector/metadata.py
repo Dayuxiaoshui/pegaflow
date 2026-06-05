@@ -12,6 +12,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 
 BlockIds = tuple[list[int], ...]
 
+RELEASE_CONSUMER_ABORT = "consumer_abort"
+RELEASE_PRODUCER_ABORT = "producer_abort"
+RELEASE_PRODUCER_FINISHED = "producer_finished"
+RELEASE_PRODUCER_PREEMPTED = "producer_preempted"
+
 
 def normalize_block_ids(block_ids: Any) -> BlockIds:
     """Convert vLLM block-id containers to a tuple of mutable group lists."""
@@ -69,11 +74,13 @@ class TransferRegionLayout:
     region_idx: int
     base_addr: int
     block_len: int
+    block_stride: int | None = None
 
     def __post_init__(self) -> None:
         assert self.region_idx >= 0
         assert self.base_addr > 0
         assert self.block_len > 0
+        assert self.block_stride is None or self.block_stride >= self.block_len
 
 
 @dataclass(frozen=True)
@@ -105,6 +112,9 @@ class PdHandshake:
     block_size: int
     layers: tuple[LayerRemoteLayout, ...]
     imm_id: int | None = None
+    fail_imm_id: int | None = None
+    abort_imm_id: int | None = None
+    expected_imm_count: int = 1
 
 
 def layer_layout_from_dict(
@@ -129,6 +139,9 @@ def layer_layout_from_dict(
                 region_idx=int(region["region_idx"]),
                 base_addr=int(region["base_addr"]),
                 block_len=int(region["block_len"]),
+                block_stride=(
+                    int(region["block_stride"]) if region.get("block_stride") is not None else None
+                ),
             )
             for region in data["regions"]
         ),
@@ -153,6 +166,9 @@ def handshake_from_dict(data: dict[str, Any] | None) -> PdHandshake | None:
             layer_layout_from_dict(layer, block_ids=shared_block_ids) for layer in data["layers"]
         ),
         imm_id=int(data["imm_id"]) if data.get("imm_id") is not None else None,
+        fail_imm_id=int(data["fail_imm_id"]) if data.get("fail_imm_id") is not None else None,
+        abort_imm_id=int(data["abort_imm_id"]) if data.get("abort_imm_id") is not None else None,
+        expected_imm_count=int(data.get("expected_imm_count") or 1),
     )
 
 
@@ -170,14 +186,7 @@ def layer_layout_to_dict(layer: LayerRemoteLayout) -> dict[str, Any]:
         "layer_name": layer.layer_name,
         "layer_idx": layer.layer_idx,
         "block_ids": list(layer.block_ids),
-        "regions": [
-            {
-                "region_idx": region.region_idx,
-                "base_addr": region.base_addr,
-                "block_len": region.block_len,
-            }
-            for region in layer.regions
-        ],
+        "regions": [_region_layout_to_dict(region) for region in layer.regions],
         "mr_desc": layer.mr_desc,
     }
 
@@ -186,16 +195,20 @@ def layer_layout_to_compact_dict(layer: LayerRemoteLayout) -> dict[str, Any]:
     return {
         "layer_name": layer.layer_name,
         "layer_idx": layer.layer_idx,
-        "regions": [
-            {
-                "region_idx": region.region_idx,
-                "base_addr": region.base_addr,
-                "block_len": region.block_len,
-            }
-            for region in layer.regions
-        ],
+        "regions": [_region_layout_to_dict(region) for region in layer.regions],
         "mr_desc": layer.mr_desc,
     }
+
+
+def _region_layout_to_dict(region: TransferRegionLayout) -> dict[str, Any]:
+    data = {
+        "region_idx": region.region_idx,
+        "base_addr": region.base_addr,
+        "block_len": region.block_len,
+    }
+    if region.block_stride is not None:
+        data["block_stride"] = region.block_stride
+    return data
 
 
 def handshake_to_dict(handshake: PdHandshake) -> dict[str, Any]:
@@ -207,6 +220,9 @@ def handshake_to_dict(handshake: PdHandshake) -> dict[str, Any]:
         "block_size": handshake.block_size,
         "layers": [layer_layout_to_dict(layer) for layer in handshake.layers],
         "imm_id": handshake.imm_id,
+        "fail_imm_id": handshake.fail_imm_id,
+        "abort_imm_id": handshake.abort_imm_id,
+        "expected_imm_count": handshake.expected_imm_count,
     }
 
 
@@ -225,6 +241,9 @@ def handshake_to_compact_dict(handshake: PdHandshake) -> dict[str, Any]:
         "block_ids": list(block_ids),
         "layers": [layer_layout_to_compact_dict(layer) for layer in handshake.layers],
         "imm_id": handshake.imm_id,
+        "fail_imm_id": handshake.fail_imm_id,
+        "abort_imm_id": handshake.abort_imm_id,
+        "expected_imm_count": handshake.expected_imm_count,
     }
 
 
@@ -236,16 +255,24 @@ class PdConnectorMetadata(KVConnectorMetadata):
         reqs_to_wait: dict[str, WaitReqMeta] | None = None,
         reqs_to_push: dict[str, PushReqMeta] | None = None,
         reqs_to_release: set[str] | None = None,
+        release_reasons: dict[str, str] | None = None,
+        preempted_req_ids: set[str] | None = None,
     ) -> None:
         super().__init__()
         self.reqs_to_wait = reqs_to_wait or {}
         self.reqs_to_push = reqs_to_push or {}
         self.reqs_to_release = reqs_to_release or set()
+        self.release_reasons = release_reasons or {}
+        self.preempted_req_ids = preempted_req_ids or set()
 
 
 @dataclass
 class PdWorkerMetadata(KVConnectorWorkerMetadata):
+    failed_recving: set[str] = field(default_factory=set)
+
     def aggregate(self, other: KVConnectorWorkerMetadata) -> KVConnectorWorkerMetadata:
+        assert isinstance(other, PdWorkerMetadata)
+        self.failed_recving.update(other.failed_recving)
         return self
 
 

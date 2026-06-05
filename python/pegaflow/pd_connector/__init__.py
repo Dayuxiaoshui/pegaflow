@@ -12,6 +12,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
 )
 
 from pegaflow.pd_connector.metadata import PdConnectorMetadata
+from pegaflow.pd_connector.metrics import PdKVConnectorStats, PdMetricsTracker, PdPromMetrics
 from pegaflow.pd_connector.scheduler import PdSchedulerConnector
 from pegaflow.pd_connector.worker import PdWorkerConnector, model_uses_mla
 
@@ -24,10 +25,15 @@ class PdConnector(KVConnectorBase_V1, SupportsHMA):
         _assert_supported_config(vllm_config)
         self._scheduler: PdSchedulerConnector | None = None
         self._worker: PdWorkerConnector | None = None
+        self._metrics = PdMetricsTracker()
         if role == KVConnectorRole.SCHEDULER:
-            self._scheduler = PdSchedulerConnector(vllm_config)
+            self._scheduler = PdSchedulerConnector(vllm_config, metrics=self._metrics)
         elif role == KVConnectorRole.WORKER:
-            self._worker = PdWorkerConnector(vllm_config, kv_cache_config=kv_cache_config)
+            self._worker = PdWorkerConnector(
+                vllm_config,
+                kv_cache_config=kv_cache_config,
+                metrics=self._metrics,
+            )
         else:
             raise ValueError(f"unsupported KV connector role: {role}")
 
@@ -39,7 +45,7 @@ class PdConnector(KVConnectorBase_V1, SupportsHMA):
 
     @classmethod
     def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
-        return True
+        return not bool(extra_config.get("pegaflow.pd.allow_full_decode_cudagraph", False))
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
         if self._worker is not None:
@@ -132,11 +138,31 @@ class PdConnector(KVConnectorBase_V1, SupportsHMA):
         assert self._scheduler is not None
         return self._scheduler.request_finished(request, block_ids)
 
+    def get_kv_connector_stats(self) -> PdKVConnectorStats | None:
+        return self._metrics.get_stats()
+
+    @classmethod
+    def build_kv_connector_stats(cls, data: dict | None = None) -> PdKVConnectorStats | None:
+        if data is None:
+            return None
+        return PdKVConnectorStats(data=data)
+
+    @classmethod
+    def build_prom_metrics(
+        cls,
+        vllm_config,
+        metric_types,
+        labelnames,
+        per_engine_labelvalues,
+    ) -> PdPromMetrics:
+        return PdPromMetrics(vllm_config, metric_types, labelnames, per_engine_labelvalues)
+
 
 __all__ = ["PdConnector"]
 
 
 def _assert_supported_config(vllm_config: Any) -> None:
+    _assert_mtp_not_supported(vllm_config)
     if not model_uses_mla(vllm_config):
         return
     parallel_config = getattr(vllm_config, "parallel_config", None)
@@ -148,3 +174,22 @@ def _assert_supported_config(vllm_config: Any) -> None:
     assert pcp_world_size == 1, (
         "PdConnector MLA first version requires prefill_context_parallel_size == 1"
     )
+
+
+def _assert_mtp_not_supported(vllm_config: Any) -> None:
+    model_config = getattr(vllm_config, "model_config", None)
+    hf_config = getattr(model_config, "hf_text_config", None)
+    candidates = (model_config, hf_config)
+    numeric_fields = (
+        "num_nextn_predict_layers",
+        "num_mtp_layers",
+        "mtp_num_layers",
+    )
+    for config in candidates:
+        if config is None:
+            continue
+        if bool(getattr(config, "use_mtp", False)):
+            raise AssertionError("PdConnector does not support MTP layout")
+        for field in numeric_fields:
+            if int(getattr(config, field, 0) or 0) > 0:
+                raise AssertionError("PdConnector does not support MTP layout")

@@ -19,10 +19,13 @@ from pegaflow.logging_utils import get_connector_logger
 from pegaflow.pd_connector.decode_worker import DecodeHandler
 from pegaflow.pd_connector.layout import KvCacheLayout, layout_from_tensor
 from pegaflow.pd_connector.metadata import (
+    RELEASE_CONSUMER_ABORT,
+    RELEASE_PRODUCER_PREEMPTED,
     LayerRemoteLayout,
     PdConnectorMetadata,
     PdWorkerMetadata,
 )
+from pegaflow.pd_connector.metrics import PdKVConnectorStats, PdMetricsTracker
 from pegaflow.pd_connector.prefill_worker import PrefillHandler
 from pegaflow.pd_connector.rdma import RdmaPort, build_rdma_port
 
@@ -36,9 +39,11 @@ class PdWorkerConnector:
         kv_cache_config: Any = None,
         rdma: RdmaPort | None = None,
         prefill_sender: Any | None = None,
+        metrics: PdMetricsTracker | None = None,
     ) -> None:
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
+        self.metrics = metrics or PdMetricsTracker()
         self.use_mla = model_uses_mla(vllm_config)
         self.logical_block_size = _logical_block_size(vllm_config)
         self._layer_specs = _layer_specs_from_config(kv_cache_config)
@@ -56,6 +61,8 @@ class PdWorkerConnector:
         self.layer_names: list[str] = []
         self._registered_layers: dict[str, LayerRemoteLayout] = {}
         self._forward_step_id = 0
+        self._idle_decode_step = False
+        self._failed_load_block_ids: set[int] = set()
 
         self._decode = DecodeHandler(self, prefill_sender=prefill_sender)
         self._prefill = PrefillHandler(self)
@@ -143,6 +150,7 @@ class PdWorkerConnector:
         **kwargs: Any,
     ) -> None:
         self._forward_step_id += 1
+        self._idle_decode_step = False
         logger.debug(
             "[PdConnector] worker start_load_kv metadata=%s wait_reqs=%s push_reqs=%s release=%s known_wait=%s known_push=%s",
             metadata,
@@ -152,18 +160,42 @@ class PdWorkerConnector:
             sorted(self._decode.wait_reqs),
             sorted(self._prefill.push_reqs),
         )
+        if (
+            not metadata.reqs_to_wait
+            and not metadata.reqs_to_push
+            and not metadata.reqs_to_release
+            and not metadata.preempted_req_ids
+            and self._decode.is_idle()
+            and not self._prefill.has_state()
+        ):
+            self._idle_decode_step = True
+            return
+
         assert self.rdma is not None, "PdConnector RDMA port is not initialized"
 
         self._decode.process_wait_reqs(metadata.reqs_to_wait)
         self._prefill.process_push_reqs(metadata.reqs_to_push)
 
+        for req_id in metadata.preempted_req_ids:
+            logger.debug("[PdConnector] worker preempt req=%s", req_id)
+            for push_req_id in self._prefill.release(req_id, RELEASE_PRODUCER_PREEMPTED):
+                self.rdma.close_request(push_req_id)
+
         for req_id in metadata.reqs_to_release:
-            logger.debug("[PdConnector] worker release req=%s", req_id)
-            self._decode.release(req_id)
-            self._prefill.release(req_id)
-            self.rdma.close_request(req_id)
+            reason = metadata.release_reasons.get(req_id, RELEASE_CONSUMER_ABORT)
+            logger.debug("[PdConnector] worker release req=%s reason=%s", req_id, reason)
+            if reason == RELEASE_CONSUMER_ABORT:
+                self._decode.release(req_id)
+            released_push_req_ids = self._prefill.release(req_id, reason)
+            if released_push_req_ids:
+                for push_req_id in released_push_req_ids:
+                    self.rdma.close_request(push_req_id)
+            elif reason != RELEASE_CONSUMER_ABORT:
+                self.rdma.close_request(req_id)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
+        if self._idle_decode_step:
+            return None
         assert layer_name in self.layouts, (
             f"PdConnector saw unknown layer {layer_name}; registered={list(self.layouts)}"
         )
@@ -176,12 +208,19 @@ class PdWorkerConnector:
         attn_metadata: Any,
         **kwargs: Any,
     ) -> None:
+        if self._idle_decode_step:
+            return
         self._prefill.save_kv_layer(layer_name, kv_layer, attn_metadata, **kwargs)
 
     def wait_for_save(self) -> None:
+        if self._idle_decode_step:
+            return
         self._prefill.wait_for_save()
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str] | None, set[str] | None]:
+        if not finished_req_ids and self._decode.is_idle() and not self._prefill.has_state():
+            return None, None
+
         logger.debug(
             "[PdConnector] worker get_finished enter finished_req_ids=%s wait_reqs=%s push_reqs=%s",
             sorted(finished_req_ids),
@@ -193,6 +232,10 @@ class PdWorkerConnector:
         for req_id in releasable_sending:
             self.rdma.close_request(req_id)
         finished_recving = self.rdma.pop_finished_recving()
+        finished_recving.update(self._decode.pop_finished_aborted_recving())
+        failed_recving = self._decode.pop_failed_recving()
+        if failed_recving:
+            finished_recving.update(failed_recving)
         if finished_recving:
             report_ts_ns = time.time_ns()
             logger.info(
@@ -214,10 +257,19 @@ class PdWorkerConnector:
         return releasable_sending or None, finished_recving or None
 
     def get_block_ids_with_load_errors(self) -> set[int]:
-        return set()
+        self._failed_load_block_ids.update(self._decode.pop_failed_block_ids())
+        failed = self._failed_load_block_ids
+        self._failed_load_block_ids = set()
+        return failed
 
     def build_connector_worker_meta(self) -> PdWorkerMetadata | None:
-        return None
+        failed_recving = self._decode.pop_failed_recving_for_meta()
+        if not failed_recving:
+            return None
+        return PdWorkerMetadata(failed_recving=failed_recving)
+
+    def get_stats(self) -> PdKVConnectorStats:
+        return self.metrics.get_stats()
 
     def shutdown(self) -> None:
         self._decode.shutdown()

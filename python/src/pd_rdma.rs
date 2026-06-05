@@ -48,6 +48,19 @@ where
     value.extract()
 }
 
+fn py_get_optional<'py, T>(dict: &Bound<'py, PyDict>, key: &str) -> PyResult<Option<T>>
+where
+    for<'a> T: FromPyObject<'a, 'py, Error = PyErr>,
+{
+    let Some(value) = dict.get_item(key)? else {
+        return Ok(None);
+    };
+    if value.is_none() {
+        return Ok(None);
+    }
+    value.extract().map(Some)
+}
+
 fn wait_atomic_count(counter: &AtomicI64, target: i64, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     let mut waits = 0;
@@ -77,6 +90,46 @@ fn wait_write_window(
     true
 }
 
+fn wait_imm_or_fail(
+    done_counter: &ImmCounter,
+    fail_counter: &ImmCounter,
+    abort_counter: &ImmCounter,
+    expected_done: u32,
+    timeout: Duration,
+) -> PdImmWaitResult {
+    let deadline = Instant::now() + timeout;
+    let mut waits = 0;
+    loop {
+        if fail_counter.wait_timeout(1, Duration::ZERO) {
+            return PdImmWaitResult::Failed;
+        }
+        if abort_counter.wait_timeout(1, Duration::ZERO) {
+            return PdImmWaitResult::Aborted;
+        }
+        if done_counter.wait_timeout(expected_done, Duration::ZERO) {
+            return PdImmWaitResult::Done;
+        }
+        if Instant::now() >= deadline {
+            return PdImmWaitResult::TimedOut;
+        }
+        wait_backoff(&mut waits);
+    }
+}
+
+enum PdImmWaitResult {
+    Done,
+    Failed,
+    Aborted,
+    TimedOut,
+}
+
+#[derive(Clone, Copy)]
+enum PdRequestImmKind {
+    Done,
+    Fail,
+    Abort,
+}
+
 fn wait_backoff(waits: &mut u32) {
     if *waits < WAIT_SPINS_BEFORE_YIELD {
         std::hint::spin_loop();
@@ -97,6 +150,22 @@ fn pd_imm(req_id: &str) -> u32 {
     hash
 }
 
+fn pd_fail_imm(imm: u32) -> u32 {
+    imm ^ 0x8000_0000
+}
+
+fn fail_counter_key(req_id: &str) -> String {
+    format!("{req_id}#fail")
+}
+
+fn pd_abort_imm(imm: u32) -> u32 {
+    imm ^ 0x4000_0000
+}
+
+fn abort_counter_key(req_id: &str) -> String {
+    format!("{req_id}#abort")
+}
+
 #[derive(Clone)]
 struct PdLocalLayer {
     base_addr: u64,
@@ -108,6 +177,7 @@ struct PdLocalLayer {
 struct PdRemoteRegion {
     base_addr: u64,
     block_len: u64,
+    block_stride: u64,
 }
 
 #[derive(Clone)]
@@ -120,6 +190,9 @@ struct PdRemoteLayer {
 struct PdRemoteRequest {
     remote_request_id: String,
     imm_data: u32,
+    fail_imm_data: u32,
+    abort_imm_data: u32,
+    expected_imm_count: u32,
     layers: HashMap<u64, PdRemoteLayer>,
 }
 
@@ -423,12 +496,45 @@ impl PdRdmaEngine {
             Some(value) if !value.is_none() => value.extract()?,
             _ => pd_imm(&remote_request_id),
         };
+        let fail_imm = match handshake.get_item("fail_imm_id")? {
+            Some(value) if !value.is_none() => value.extract()?,
+            _ => pd_fail_imm(imm),
+        };
+        let abort_imm = match handshake.get_item("abort_imm_id")? {
+            Some(value) if !value.is_none() => value.extract()?,
+            _ => pd_abort_imm(imm),
+        };
+        if fail_imm == imm {
+            return Err(PyValueError::new_err("fail_imm_id must differ from imm_id"));
+        }
+        if abort_imm == imm || abort_imm == fail_imm {
+            return Err(PyValueError::new_err(
+                "abort_imm_id must differ from imm_id and fail_imm_id",
+            ));
+        }
+        let expected_imm_count = match handshake.get_item("expected_imm_count")? {
+            Some(value) if !value.is_none() => value.extract::<u32>()?,
+            _ => 1,
+        };
+        if expected_imm_count == 0 {
+            return Err(PyValueError::new_err("expected_imm_count must be positive"));
+        }
         self.imm_to_req.lock().unwrap().insert(imm, req_id.clone());
         self.imm_counters
             .lock()
             .unwrap()
             .entry(req_id.clone())
             .or_insert_with(|| self.engine.get_imm_counter(imm));
+        self.imm_counters
+            .lock()
+            .unwrap()
+            .entry(fail_counter_key(&req_id))
+            .or_insert_with(|| self.engine.get_imm_counter(fail_imm));
+        self.imm_counters
+            .lock()
+            .unwrap()
+            .entry(abort_counter_key(&req_id))
+            .or_insert_with(|| self.engine.get_imm_counter(abort_imm));
 
         let layers_any = handshake
             .get_item("layers")?
@@ -463,7 +569,9 @@ impl PdRdmaEngine {
                 }
                 let base_addr: u64 = py_get(&region, "base_addr")?;
                 let block_len: u64 = py_get(&region, "block_len")?;
-                if base_addr == 0 || block_len == 0 {
+                let block_stride: u64 =
+                    py_get_optional(&region, "block_stride")?.unwrap_or(block_len);
+                if base_addr == 0 || block_len == 0 || block_stride < block_len {
                     return Err(PyValueError::new_err(format!(
                         "remote layer {layer_idx} region {region_idx} has invalid address range"
                     )));
@@ -471,6 +579,7 @@ impl PdRdmaEngine {
                 regions.push(PdRemoteRegion {
                     base_addr,
                     block_len,
+                    block_stride,
                 });
             }
             if regions.is_empty() {
@@ -517,6 +626,9 @@ impl PdRdmaEngine {
             PdRemoteRequest {
                 remote_request_id,
                 imm_data: imm,
+                fail_imm_data: fail_imm,
+                abort_imm_data: abort_imm,
+                expected_imm_count,
                 layers,
             },
         );
@@ -567,14 +679,16 @@ impl PdRdmaEngine {
                         "block regions must be ordered by region_idx",
                     ));
                 }
-                let target =
-                    self.block_slice_to_scatter_target(&local, &remote, &region, region_idx)?;
-                dst_bytes = dst_bytes.checked_add(target.length).ok_or_else(|| {
-                    PyValueError::new_err(format!(
-                        "RDMA scatter byte count overflow for req={req_id} layer={layer_idx}"
-                    ))
-                })?;
-                dsts.push(target);
+                let targets =
+                    self.block_slice_to_scatter_targets(&local, &remote, &region, region_idx)?;
+                for target in targets {
+                    dst_bytes = dst_bytes.checked_add(target.length).ok_or_else(|| {
+                        PyValueError::new_err(format!(
+                            "RDMA scatter byte count overflow for req={req_id} layer={layer_idx}"
+                        ))
+                    })?;
+                    dsts.push(target);
+                }
             }
         }
         if dsts.is_empty() {
@@ -703,110 +817,51 @@ impl PdRdmaEngine {
 
     fn push_done(&self, py: Python<'_>, req_id: String) -> PyResult<()> {
         self.wait_for_request_writes(py, &req_id, Duration::from_secs(30))?;
-        let start = Instant::now();
-        let remote = self
-            .remote_requests
-            .lock()
-            .unwrap()
-            .get(&req_id)
-            .ok_or_else(|| {
-                PyRuntimeError::new_err(format!("remote req {req_id} is not registered"))
-            })?
-            .layers
-            .values()
-            .next()
-            .cloned()
-            .ok_or_else(|| PyRuntimeError::new_err(format!("remote req {req_id} has no layers")))?;
-        let imm_data = self
-            .remote_requests
-            .lock()
-            .unwrap()
-            .get(&req_id)
-            .map(|request| request.imm_data)
-            .ok_or_else(|| {
-                PyRuntimeError::new_err(format!("remote req {req_id} is not registered"))
-            })?;
-        let tx_counter = Arc::new(AtomicI64::new(0));
-        let err_counter = Arc::new(AtomicI64::new(0));
-        log::info!(
-            "[PdRdmaEngine] RDMA IMM submit start req={} imm={} domains={}",
-            req_id,
-            imm_data,
-            self.engine.num_domains(),
-        );
-        self.engine
-            .submit_transfer_atomic(
-                TransferRequest::Imm(ImmTransferRequest {
-                    imm_data,
-                    dst_mr: remote.mr_desc,
-                    domain: self.imm_domain,
-                }),
-                Arc::clone(&tx_counter),
-                Arc::clone(&err_counter),
-            )
-            .map_err(|err| {
-                log::error!(
-                    "[PdRdmaEngine] RDMA IMM submit failed req={} imm={} err={err}",
-                    req_id,
-                    imm_data,
-                );
-                pd_rdma_error("submit IMM failed", err)
-            })?;
-        if !py.detach(|| wait_atomic_count(&tx_counter, 1, Duration::from_secs(30))) {
-            log::error!(
-                "[PdRdmaEngine] RDMA IMM timed out req={} imm={} completed={} errors={} wait_ms={:.3}",
-                req_id,
-                imm_data,
-                tx_counter.load(Ordering::Acquire),
-                err_counter.load(Ordering::Acquire),
-                duration_ms(start.elapsed()),
-            );
-            return Err(PegaFlowError::new_err(format!(
-                "RDMA IMM timed out for req={req_id} completed={}",
-                tx_counter.load(Ordering::Acquire)
-            )));
-        }
-        let errors = err_counter.load(Ordering::Acquire);
-        if errors != 0 {
-            log::error!(
-                "[PdRdmaEngine] RDMA IMM failed req={} imm={} completed={} errors={} wait_ms={:.3}",
-                req_id,
-                imm_data,
-                tx_counter.load(Ordering::Acquire),
-                errors,
-                duration_ms(start.elapsed()),
-            );
-            return Err(PegaFlowError::new_err(format!(
-                "RDMA IMM failed for req={req_id} errors={errors}"
-            )));
-        }
-        log::info!(
-            "[PdRdmaEngine] RDMA IMM done req={} imm={} wait_ms={:.3}",
-            req_id,
-            imm_data,
-            duration_ms(start.elapsed()),
-        );
+        self.send_request_imm(py, &req_id, PdRequestImmKind::Done)?;
         self.finished_sending.lock().unwrap().insert(req_id);
         Ok(())
     }
 
+    fn fail_request(&self, py: Python<'_>, req_id: String) -> PyResult<()> {
+        self.send_request_imm(py, &req_id, PdRequestImmKind::Fail)
+    }
+
+    fn abort_request(&self, py: Python<'_>, req_id: String) -> PyResult<()> {
+        self.send_request_imm(py, &req_id, PdRequestImmKind::Abort)
+    }
+
     fn wait_done(&self, py: Python<'_>, req_id: String) -> PyResult<()> {
-        let (remote_request_id, imm_data) = self
+        let (remote_request_id, imm_data, fail_imm_data, abort_imm_data, expected_imm_count) = self
             .remote_requests
             .lock()
             .unwrap()
             .get(&req_id)
-            .map(|request| (request.remote_request_id.clone(), request.imm_data))
+            .map(|request| {
+                (
+                    request.remote_request_id.clone(),
+                    request.imm_data,
+                    request.fail_imm_data,
+                    request.abort_imm_data,
+                    request.expected_imm_count,
+                )
+            })
             .unwrap_or_else(|| {
                 let fallback = pd_imm(&req_id);
-                (req_id.clone(), fallback)
+                (
+                    req_id.clone(),
+                    fallback,
+                    pd_fail_imm(fallback),
+                    pd_abort_imm(fallback),
+                    1,
+                )
             });
         if self.finished_recving.lock().unwrap().contains(&req_id) {
             log::info!(
-                "[PdRdmaEngine] RDMA IMM wait already done req={} remote_req={} imm={}",
+                "[PdRdmaEngine] RDMA IMM wait already done req={} remote_req={} imm={} expected={}",
                 req_id,
                 remote_request_id,
                 imm_data,
+                expected_imm_count,
             );
             return Ok(());
         }
@@ -819,29 +874,84 @@ impl PdRdmaEngine {
             .clone();
         let start = Instant::now();
         log::info!(
-            "[PdRdmaEngine] RDMA IMM wait start req={} remote_req={} imm={}",
+            "[PdRdmaEngine] RDMA IMM wait start req={} remote_req={} imm={} fail_imm={} abort_imm={} expected={}",
             req_id,
             remote_request_id,
             imm_data,
+            fail_imm_data,
+            abort_imm_data,
+            expected_imm_count,
         );
-        let done = py.detach(|| counter.wait_timeout(1, Duration::from_secs(30)));
-        if !done {
-            log::error!(
-                "[PdRdmaEngine] RDMA IMM wait timed out req={} remote_req={} imm={} wait_ms={:.3}",
-                req_id,
-                remote_request_id,
-                imm_data,
-                duration_ms(start.elapsed()),
-            );
-            return Err(PegaFlowError::new_err(format!(
-                "RDMA IMM wait timed out for req={req_id} remote_request_id={remote_request_id}"
-            )));
+        let fail_counter = self
+            .imm_counters
+            .lock()
+            .unwrap()
+            .entry(fail_counter_key(&req_id))
+            .or_insert_with(|| self.engine.get_imm_counter(fail_imm_data))
+            .clone();
+        let abort_counter = self
+            .imm_counters
+            .lock()
+            .unwrap()
+            .entry(abort_counter_key(&req_id))
+            .or_insert_with(|| self.engine.get_imm_counter(abort_imm_data))
+            .clone();
+        let result = py.detach(|| {
+            wait_imm_or_fail(
+                &counter,
+                &fail_counter,
+                &abort_counter,
+                expected_imm_count,
+                Duration::from_secs(30),
+            )
+        });
+        match result {
+            PdImmWaitResult::Done => {}
+            PdImmWaitResult::Failed => {
+                log::error!(
+                    "[PdRdmaEngine] RDMA IMM wait failed req={} remote_req={} imm={} fail_imm={} expected={} wait_ms={:.3}",
+                    req_id,
+                    remote_request_id,
+                    imm_data,
+                    fail_imm_data,
+                    expected_imm_count,
+                    duration_ms(start.elapsed()),
+                );
+                return Err(PegaFlowError::new_err(format!(
+                    "RDMA IMM wait failed for req={req_id} remote_request_id={remote_request_id}"
+                )));
+            }
+            PdImmWaitResult::Aborted => {
+                log::info!(
+                    "[PdRdmaEngine] RDMA IMM wait abort-acked req={} remote_req={} imm={} abort_imm={} wait_ms={:.3}",
+                    req_id,
+                    remote_request_id,
+                    imm_data,
+                    abort_imm_data,
+                    duration_ms(start.elapsed()),
+                );
+            }
+            PdImmWaitResult::TimedOut => {
+                log::error!(
+                    "[PdRdmaEngine] RDMA IMM wait timed out req={} remote_req={} imm={} fail_imm={} expected={} wait_ms={:.3}",
+                    req_id,
+                    remote_request_id,
+                    imm_data,
+                    fail_imm_data,
+                    expected_imm_count,
+                    duration_ms(start.elapsed()),
+                );
+                return Err(PegaFlowError::new_err(format!(
+                    "RDMA IMM wait timed out for req={req_id} remote_request_id={remote_request_id}"
+                )));
+            }
         }
         log::info!(
-            "[PdRdmaEngine] RDMA IMM wait done req={} remote_req={} imm={} wait_ms={:.3}",
+            "[PdRdmaEngine] RDMA IMM wait done req={} remote_req={} imm={} expected={} wait_ms={:.3}",
             req_id,
             remote_request_id,
             imm_data,
+            expected_imm_count,
             duration_ms(start.elapsed()),
         );
         self.finished_recving.lock().unwrap().insert(req_id);
@@ -888,9 +998,19 @@ impl PdRdmaEngine {
     fn close_request(&self, req_id: String) {
         if let Some(request) = self.remote_requests.lock().unwrap().remove(&req_id) {
             self.engine.remove_imm_count(request.imm_data);
+            self.engine.remove_imm_count(request.fail_imm_data);
+            self.engine.remove_imm_count(request.abort_imm_data);
             self.imm_to_req.lock().unwrap().remove(&request.imm_data);
         }
         self.imm_counters.lock().unwrap().remove(&req_id);
+        self.imm_counters
+            .lock()
+            .unwrap()
+            .remove(&fail_counter_key(&req_id));
+        self.imm_counters
+            .lock()
+            .unwrap()
+            .remove(&abort_counter_key(&req_id));
         self.pending_writes.lock().unwrap().remove(&req_id);
         self.finished_sending.lock().unwrap().remove(&req_id);
         self.finished_recving.lock().unwrap().remove(&req_id);
@@ -918,6 +1038,101 @@ impl PdRdmaEngine {
 }
 
 impl PdRdmaEngine {
+    fn send_request_imm(
+        &self,
+        py: Python<'_>,
+        req_id: &str,
+        kind: PdRequestImmKind,
+    ) -> PyResult<()> {
+        let start = Instant::now();
+        let (remote, imm_data) = {
+            let requests = self.remote_requests.lock().unwrap();
+            let request = requests.get(req_id).ok_or_else(|| {
+                PyRuntimeError::new_err(format!("remote req {req_id} is not registered"))
+            })?;
+            let remote = request.layers.values().next().cloned().ok_or_else(|| {
+                PyRuntimeError::new_err(format!("remote req {req_id} has no layers"))
+            })?;
+            let imm_data = match kind {
+                PdRequestImmKind::Done => request.imm_data,
+                PdRequestImmKind::Fail => request.fail_imm_data,
+                PdRequestImmKind::Abort => request.abort_imm_data,
+            };
+            (remote, imm_data)
+        };
+        let label = match kind {
+            PdRequestImmKind::Done => "IMM",
+            PdRequestImmKind::Fail => "fail IMM",
+            PdRequestImmKind::Abort => "abort IMM",
+        };
+        let tx_counter = Arc::new(AtomicI64::new(0));
+        let err_counter = Arc::new(AtomicI64::new(0));
+        log::info!(
+            "[PdRdmaEngine] RDMA {} submit start req={} imm={} domains={}",
+            label,
+            req_id,
+            imm_data,
+            self.engine.num_domains(),
+        );
+        self.engine
+            .submit_transfer_atomic(
+                TransferRequest::Imm(ImmTransferRequest {
+                    imm_data,
+                    dst_mr: remote.mr_desc,
+                    domain: self.imm_domain,
+                }),
+                Arc::clone(&tx_counter),
+                Arc::clone(&err_counter),
+            )
+            .map_err(|err| {
+                log::error!(
+                    "[PdRdmaEngine] RDMA {} submit failed req={} imm={} err={err}",
+                    label,
+                    req_id,
+                    imm_data,
+                );
+                pd_rdma_error(&format!("submit {label} failed"), err)
+            })?;
+        if !py.detach(|| wait_atomic_count(&tx_counter, 1, Duration::from_secs(30))) {
+            log::error!(
+                "[PdRdmaEngine] RDMA {} timed out req={} imm={} completed={} errors={} wait_ms={:.3}",
+                label,
+                req_id,
+                imm_data,
+                tx_counter.load(Ordering::Acquire),
+                err_counter.load(Ordering::Acquire),
+                duration_ms(start.elapsed()),
+            );
+            return Err(PegaFlowError::new_err(format!(
+                "RDMA {label} timed out for req={req_id} completed={}",
+                tx_counter.load(Ordering::Acquire)
+            )));
+        }
+        let errors = err_counter.load(Ordering::Acquire);
+        if errors != 0 {
+            log::error!(
+                "[PdRdmaEngine] RDMA {} failed req={} imm={} completed={} errors={} wait_ms={:.3}",
+                label,
+                req_id,
+                imm_data,
+                tx_counter.load(Ordering::Acquire),
+                errors,
+                duration_ms(start.elapsed()),
+            );
+            return Err(PegaFlowError::new_err(format!(
+                "RDMA {label} failed for req={req_id} errors={errors}"
+            )));
+        }
+        log::info!(
+            "[PdRdmaEngine] RDMA {} done req={} imm={} wait_ms={:.3}",
+            label,
+            req_id,
+            imm_data,
+            duration_ms(start.elapsed()),
+        );
+        Ok(())
+    }
+
     fn wait_for_request_writes(
         &self,
         py: Python<'_>,
@@ -977,13 +1192,13 @@ impl PdRdmaEngine {
         Ok(())
     }
 
-    fn block_slice_to_scatter_target(
+    fn block_slice_to_scatter_targets(
         &self,
         local: &PdLocalLayer,
         remote: &PdRemoteLayer,
         block: &Bound<'_, PyDict>,
         region_idx: usize,
-    ) -> PyResult<ScatterTarget> {
+    ) -> PyResult<Vec<ScatterTarget>> {
         let block_id: u64 = py_get(block, "block_id")?;
         let src_offset: u64 = py_get(block, "src_offset_bytes")?;
         let bytes: u64 = py_get(block, "bytes")?;
@@ -1010,8 +1225,47 @@ impl PdRdmaEngine {
                 )));
             }
         }
+        if block_count == 1 || region.block_stride == region.block_len {
+            return Ok(vec![self.make_scatter_target(
+                local, remote, block_id, src_offset, bytes, region,
+            )?]);
+        }
+
+        let mut targets = Vec::with_capacity(u64_to_usize(block_count, "block_count")?);
+        for offset in 0..block_count {
+            let remote_block_id = block_id
+                .checked_add(offset)
+                .ok_or_else(|| PyValueError::new_err("remote block id overflow"))?;
+            let source_offset = src_offset
+                .checked_add(
+                    offset
+                        .checked_mul(region.block_len)
+                        .ok_or_else(|| PyValueError::new_err("source offset overflow"))?,
+                )
+                .ok_or_else(|| PyValueError::new_err("source offset overflow"))?;
+            targets.push(self.make_scatter_target(
+                local,
+                remote,
+                remote_block_id,
+                source_offset,
+                region.block_len,
+                region,
+            )?);
+        }
+        Ok(targets)
+    }
+
+    fn make_scatter_target(
+        &self,
+        local: &PdLocalLayer,
+        remote: &PdRemoteLayer,
+        block_id: u64,
+        src_offset: u64,
+        bytes: u64,
+        region: &PdRemoteRegion,
+    ) -> PyResult<ScatterTarget> {
         let remote_addr = block_id
-            .checked_mul(region.block_len)
+            .checked_mul(region.block_stride)
             .and_then(|offset| region.base_addr.checked_add(offset))
             .ok_or_else(|| PyValueError::new_err("remote block address overflow"))?;
         let dst_offset = remote_addr

@@ -14,6 +14,10 @@ from pegaflow.pd_connector.kv_params import (
     parse_producer,
 )
 from pegaflow.pd_connector.metadata import (
+    RELEASE_CONSUMER_ABORT,
+    RELEASE_PRODUCER_ABORT,
+    RELEASE_PRODUCER_FINISHED,
+    RELEASE_PRODUCER_PREEMPTED,
     PdConnectorMetadata,
     PushReqMeta,
     WaitReqMeta,
@@ -39,6 +43,20 @@ def _prompt_token_ids(request: Any) -> tuple[int, ...]:
     return tuple(int(token_id) for token_id in request.prompt_token_ids)
 
 
+def _request_was_aborted(request: Any) -> bool:
+    status = getattr(request, "status", None)
+    if status is not None and "ABORT" in str(status).upper():
+        return True
+    finish_reason = getattr(request, "finish_reason", None)
+    if finish_reason is not None and str(finish_reason).upper() == "ABORT":
+        return True
+    get_finished_reason = getattr(request, "get_finished_reason", None)
+    if get_finished_reason is None:
+        return False
+    reason = get_finished_reason()
+    return reason is not None and str(reason).upper() == "ABORT"
+
+
 class PdSchedulerConnector:
     def __init__(self, vllm_config: Any, **_kwargs: Any) -> None:
         self.vllm_config = vllm_config
@@ -48,6 +66,7 @@ class PdSchedulerConnector:
         self._reqs_to_wait: dict[str, WaitReqMeta] = {}
         self._reqs_to_push: dict[str, PushReqMeta] = {}
         self._reqs_to_release: set[str] = set()
+        self._release_reasons: dict[str, str] = {}
 
         # D-side cross-step state
         self._active_waits: dict[str, WaitReqMeta] = {}
@@ -166,31 +185,48 @@ class PdSchedulerConnector:
 
     def build_connector_meta(self, scheduler_output: Any) -> PdConnectorMetadata:
         self._add_cached_producer_chunks(scheduler_output)
+        preempted_req_ids = self._preempted_producer_req_ids(scheduler_output)
         meta = PdConnectorMetadata(
             reqs_to_wait=self._reqs_to_wait,
             reqs_to_push=self._reqs_to_push,
             reqs_to_release=self._reqs_to_release,
+            release_reasons={
+                **self._release_reasons,
+                **dict.fromkeys(preempted_req_ids, RELEASE_PRODUCER_PREEMPTED),
+            },
+            preempted_req_ids=preempted_req_ids,
         )
+        for req_id in preempted_req_ids:
+            self._active_pushes.pop(req_id, None)
+            self._reqs_to_push.pop(req_id, None)
         self._reqs_to_wait = {}
         self._reqs_to_push = {}
         self._reqs_to_release = set()
+        self._release_reasons = {}
         return meta
 
     def update_connector_output(self, connector_output: Any) -> None:
+        worker_meta = getattr(connector_output, "kv_connector_worker_meta", None)
+        failed_recving = set(getattr(worker_meta, "failed_recving", None) or ())
         for req_id in connector_output.finished_sending or ():
             self._active_pushes.pop(req_id, None)
             self._reqs_to_release.add(req_id)
+            self._release_reasons[req_id] = RELEASE_PRODUCER_FINISHED
             logger.info("[PdConnector] scheduler finished sending req=%s", req_id)
 
         for req_id in connector_output.finished_recving or ():
             finished_ts_ns = time.time_ns()
             wait_req = self._active_waits.get(req_id)
             self._active_waits.pop(req_id, None)
-            self._completed_waits.add(req_id)
+            if req_id in failed_recving:
+                self._completed_waits.discard(req_id)
+            else:
+                self._completed_waits.add(req_id)
             matched_ts_ns = self._matched_ts_ns.pop(req_id, None)
             logger.info(
-                "[PdConnector] scheduler finished recving req=%s proxy_to_finished_ms=%.3f matched_to_finished_ms=%.3f wait_to_finished_ms=%.3f ts_ns=%d",
+                "[PdConnector] scheduler finished recving req=%s failed=%s proxy_to_finished_ms=%.3f matched_to_finished_ms=%.3f wait_to_finished_ms=%.3f ts_ns=%d",
                 req_id,
+                req_id in failed_recving,
                 _elapsed_ms(wait_req.proxy_start_ts_ns, finished_ts_ns) if wait_req else -1.0,
                 _elapsed_ms(matched_ts_ns or 0, finished_ts_ns),
                 _elapsed_ms(wait_req.scheduler_wait_ts_ns, finished_ts_ns) if wait_req else -1.0,
@@ -208,9 +244,20 @@ class PdSchedulerConnector:
 
         if is_consumer(params):
             self._reqs_to_release.add(req_id)
+            self._release_reasons[req_id] = RELEASE_CONSUMER_ABORT
             self._active_waits.pop(req_id, None)
             self._completed_waits.discard(req_id)
             self._matched_ts_ns.pop(req_id, None)
+
+        if is_prod and _request_was_aborted(request):
+            self._reqs_to_release.add(req_id)
+            producer = parse_producer(params)
+            if producer is not None and producer.consumer_abort_returns_ack:
+                self._release_reasons[req_id] = RELEASE_CONSUMER_ABORT
+            else:
+                self._release_reasons[req_id] = RELEASE_PRODUCER_ABORT
+            self._active_pushes.pop(req_id, None)
+            return False, None
 
         if is_prod and _has_blocks(block_ids):
             self._active_pushes.setdefault(
@@ -223,6 +270,7 @@ class PdSchedulerConnector:
             return True, None
         if is_prod:
             self._reqs_to_release.add(req_id)
+            self._release_reasons[req_id] = RELEASE_PRODUCER_FINISHED
             self._active_pushes.pop(req_id, None)
         return False, None
 
@@ -242,6 +290,10 @@ class PdSchedulerConnector:
             if not _has_blocks(local_block_ids):
                 continue
             self._reqs_to_push[req_id] = replace(push_req, local_block_ids=local_block_ids)
+
+    def _preempted_producer_req_ids(self, scheduler_output: Any) -> set[str]:
+        preempted = getattr(scheduler_output, "preempted_req_ids", None) or set()
+        return {str(req_id) for req_id in preempted if str(req_id) in self._active_pushes}
 
     def shutdown(self) -> None:
         pass

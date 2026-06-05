@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -40,6 +41,10 @@ class RdmaPort(Protocol):
     def wait_for_pushes(self, req_id: str) -> None: ...
 
     def push_done(self, req_id: str) -> None: ...
+
+    def fail_request(self, req_id: str) -> None: ...
+
+    def abort_request(self, req_id: str) -> None: ...
 
     def aggregated_link_speed(self) -> int: ...
 
@@ -91,6 +96,12 @@ class MockRdmaPort:
 
     def push_done(self, req_id: str) -> None:
         self._finished_sending.add(req_id)
+
+    def fail_request(self, req_id: str) -> None:
+        return None
+
+    def abort_request(self, req_id: str) -> None:
+        self._finished_recving.add(req_id)
 
     def aggregated_link_speed(self) -> int:
         return 400_000_000_000
@@ -190,16 +201,20 @@ def _layer_to_native(layer: LayerRemoteLayout) -> dict[str, Any]:
         "layer_name": layer.layer_name,
         "layer_idx": layer.layer_idx,
         "block_ids": list(layer.block_ids),
-        "regions": [
-            {
-                "region_idx": region.region_idx,
-                "base_addr": region.base_addr,
-                "block_len": region.block_len,
-            }
-            for region in layer.regions
-        ],
+        "regions": [_region_to_native(region) for region in layer.regions],
         "mr_desc": _mr_desc_to_native(layer.mr_desc),
     }
+
+
+def _region_to_native(region: Any) -> dict[str, int]:
+    data = {
+        "region_idx": region.region_idx,
+        "base_addr": region.base_addr,
+        "block_len": region.block_len,
+    }
+    if region.block_stride is not None:
+        data["block_stride"] = region.block_stride
+    return data
 
 
 def _layer_from_native(layer: LayerRemoteLayout | dict[str, Any]) -> LayerRemoteLayout:
@@ -282,16 +297,17 @@ class RealRdmaPort:
         start = time.perf_counter()
         self.engine.push_layer(req_id, layer_idx, native_blocks)
         elapsed_ms = (time.perf_counter() - start) * 1000
-        logger.debug(
-            "[PdConnector] RDMA push_layer req=%s layer=%d input_blocks=%d coalesced_blocks=%d regions=%d bytes=%d native_ms=%.3f",
-            req_id,
-            layer_idx,
-            len(blocks),
-            len(native_blocks),
-            sum(len(block["regions"]) for block in native_blocks),
-            block_slices_bytes(blocks),
-            elapsed_ms,
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[PdConnector] RDMA push_layer req=%s layer=%d input_blocks=%d coalesced_blocks=%d regions=%d bytes=%d native_ms=%.3f",
+                req_id,
+                layer_idx,
+                len(blocks),
+                len(native_blocks),
+                sum(len(block["regions"]) for block in native_blocks),
+                block_slices_bytes(blocks),
+                elapsed_ms,
+            )
 
     def wait_for_pushes(self, req_id: str) -> None:
         wait_for_pushes = getattr(self.engine, "wait_for_pushes", None)
@@ -314,6 +330,34 @@ class RealRdmaPort:
         finally:
             logger.info(
                 "[PdConnector] RDMA push_done req=%s native_ms=%.3f",
+                req_id,
+                (time.perf_counter() - start) * 1000,
+            )
+
+    def fail_request(self, req_id: str) -> None:
+        fail_request = getattr(self.engine, "fail_request", None)
+        if fail_request is None:
+            return None
+        start = time.perf_counter()
+        try:
+            return fail_request(req_id)
+        finally:
+            logger.info(
+                "[PdConnector] RDMA fail_request req=%s native_ms=%.3f",
+                req_id,
+                (time.perf_counter() - start) * 1000,
+            )
+
+    def abort_request(self, req_id: str) -> None:
+        abort_request = getattr(self.engine, "abort_request", None)
+        if abort_request is None:
+            return None
+        start = time.perf_counter()
+        try:
+            return abort_request(req_id)
+        finally:
+            logger.info(
+                "[PdConnector] RDMA abort_request req=%s native_ms=%.3f",
                 req_id,
                 (time.perf_counter() - start) * 1000,
             )

@@ -12,12 +12,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -30,16 +31,187 @@ SUPPORTED_PATHS = {"/v1/completions", "/v1/chat/completions"}
 
 
 @dataclass(frozen=True)
+class PdEndpoint:
+    url: str
+    instance_id: str = ""
+
+
+@dataclass(frozen=True)
+class PdRoute:
+    prefill: PdEndpoint
+    decode: PdEndpoint
+
+    def as_tuple(self) -> tuple[str, str]:
+        return (self.prefill.url, self.decode.url)
+
+
+class PdRouter(Protocol):
+    def select(self) -> PdRoute: ...
+
+
+class RoundRobinPairRouter:
+    def __init__(
+        self,
+        *,
+        prefill_endpoints: tuple[PdEndpoint, ...],
+        decode_endpoints: tuple[PdEndpoint, ...],
+    ) -> None:
+        if not prefill_endpoints:
+            raise ValueError("PdProxy requires at least one prefill endpoint")
+        if not decode_endpoints:
+            raise ValueError("PdProxy requires at least one decode endpoint")
+        self._prefill_endpoints = tuple(prefill_endpoints)
+        self._decode_endpoints = tuple(decode_endpoints)
+        self._next_index = 0
+        self._lock = threading.Lock()
+        self._route_counts: dict[tuple[str, str], int] = {}
+
+    def select(self) -> PdRoute:
+        with self._lock:
+            index = self._next_index
+            self._next_index += 1
+            route = PdRoute(
+                prefill=self._prefill_endpoints[index % len(self._prefill_endpoints)],
+                decode=self._decode_endpoints[index % len(self._decode_endpoints)],
+            )
+            key = (route.prefill.instance_id, route.decode.instance_id)
+            self._route_counts[key] = self._route_counts.get(key, 0) + 1
+            return route
+
+    def route_counts(self) -> dict[tuple[str, str], int]:
+        with self._lock:
+            return dict(self._route_counts)
+
+
+@dataclass
+class ProxyMetrics:
+    request_count: int = 0
+    stream_request_count: int = 0
+    inflight_requests: int = 0
+    error_count: int = 0
+    decode_request_durations_s: list[float] = field(default_factory=list)
+    first_chunk_durations_s: list[float] = field(default_factory=list)
+    stream_durations_s: list[float] = field(default_factory=list)
+    stream_chunks: int = 0
+    stream_bytes: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def start_request(self, *, stream: bool) -> None:
+        with self._lock:
+            self.request_count += 1
+            if stream:
+                self.stream_request_count += 1
+            self.inflight_requests += 1
+
+    def finish_request(self, duration_s: float | None = None, *, error: bool = False) -> None:
+        with self._lock:
+            self.inflight_requests = max(0, self.inflight_requests - 1)
+            if duration_s is not None:
+                self.decode_request_durations_s.append(max(0.0, duration_s))
+            if error:
+                self.error_count += 1
+
+    def record_first_chunk(self, duration_s: float) -> None:
+        with self._lock:
+            self.first_chunk_durations_s.append(max(0.0, duration_s))
+
+    def record_stream_chunk(self, size: int) -> None:
+        with self._lock:
+            self.stream_chunks += 1
+            self.stream_bytes += max(0, int(size))
+
+    def record_stream_duration(self, duration_s: float) -> None:
+        with self._lock:
+            self.stream_durations_s.append(max(0.0, duration_s))
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "request_count": self.request_count,
+                "stream_request_count": self.stream_request_count,
+                "inflight_requests": self.inflight_requests,
+                "error_count": self.error_count,
+                "decode_request_durations_s": list(self.decode_request_durations_s),
+                "first_chunk_durations_s": list(self.first_chunk_durations_s),
+                "stream_durations_s": list(self.stream_durations_s),
+                "stream_chunks": self.stream_chunks,
+                "stream_bytes": self.stream_bytes,
+            }
+
+
+def render_proxy_metrics(config: ProxyConfig) -> bytes:
+    metrics = config.metrics.snapshot()
+    lines = [
+        "# TYPE pega_pd_proxy_requests_total counter",
+        f"pega_pd_proxy_requests_total {metrics['request_count']}",
+        "# TYPE pega_pd_proxy_stream_requests_total counter",
+        f"pega_pd_proxy_stream_requests_total {metrics['stream_request_count']}",
+        "# TYPE pega_pd_proxy_inflight_requests gauge",
+        f"pega_pd_proxy_inflight_requests {metrics['inflight_requests']}",
+        "# TYPE pega_pd_proxy_errors_total counter",
+        f"pega_pd_proxy_errors_total {metrics['error_count']}",
+        "# TYPE pega_pd_proxy_stream_chunks_total counter",
+        f"pega_pd_proxy_stream_chunks_total {metrics['stream_chunks']}",
+        "# TYPE pega_pd_proxy_stream_bytes_total counter",
+        f"pega_pd_proxy_stream_bytes_total {metrics['stream_bytes']}",
+    ]
+    _extend_summary(
+        lines,
+        "pega_pd_proxy_decode_request_duration_seconds",
+        metrics["decode_request_durations_s"],
+    )
+    _extend_summary(
+        lines,
+        "pega_pd_proxy_first_chunk_duration_seconds",
+        metrics["first_chunk_durations_s"],
+    )
+    _extend_summary(
+        lines,
+        "pega_pd_proxy_stream_duration_seconds",
+        metrics["stream_durations_s"],
+    )
+    route_counts = (
+        config.router.route_counts()
+        if config.router is not None and hasattr(config.router, "route_counts")
+        else {}
+    )
+    lines.append("# TYPE pega_pd_proxy_route_total counter")
+    for (prefill_instance, decode_instance), count in sorted(route_counts.items()):
+        lines.append(
+            "pega_pd_proxy_route_total{"
+            f'prefill_instance="{_escape_label(prefill_instance)}",'
+            f'decode_instance="{_escape_label(decode_instance)}"'
+            f"}} {count}"
+        )
+    return ("\n".join(lines) + "\n").encode()
+
+
+def _extend_summary(lines: list[str], name: str, values: list[float]) -> None:
+    count = len(values)
+    total = sum(values)
+    lines.append(f"# TYPE {name} summary")
+    lines.append(f"{name}_count {count}")
+    lines.append(f"{name}_sum {total:.9f}")
+
+
+def _escape_label(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+
+@dataclass(frozen=True)
 class ProxyConfig:
     prefill_url: str
     decode_url: str
     timeout_s: float
     prefill_max_tokens: int
+    router: PdRouter | None = None
+    metrics: ProxyMetrics = field(default_factory=ProxyMetrics)
 
 
 @dataclass(frozen=True)
 class PdProxyRequest:
     request_id: str
+    decode_url: str
     decode_body: dict[str, Any]
 
 
@@ -52,13 +224,16 @@ def build_pd_proxy_request(
     req_id = request_id or str(body.get("request_id") or f"pd-{uuid.uuid4().hex}")
     prefill_req_id = f"{req_id}-p"
     decode_req_id = f"{req_id}-d"
+    route = config.router.select() if config.router is not None else None
+    prefill_url = (route.prefill.url if route is not None else config.prefill_url).rstrip("/")
+    decode_url = (route.decode.url if route is not None else config.decode_url).rstrip("/")
 
     decode_body = {
         **body,
         "request_id": decode_req_id,
     }
     decode_body["kv_transfer_params"] = ConsumerKvParams(
-        prefill_url=config.prefill_url,
+        prefill_url=prefill_url,
         remote_request_id=prefill_req_id,
         done_request_id=decode_req_id,
         prefill_max_tokens=config.prefill_max_tokens,
@@ -67,6 +242,7 @@ def build_pd_proxy_request(
 
     return PdProxyRequest(
         request_id=req_id,
+        decode_url=decode_url,
         decode_body=decode_body,
     )
 
@@ -81,30 +257,40 @@ class PdProxy:
             return HTTPStatus.NOT_FOUND, json.dumps(payload).encode(), "application/json"
 
         start_ts_ns = time.time_ns()
+        self.config.metrics.start_request(stream=False)
         req = build_pd_proxy_request(body, self.config, proxy_start_ts_ns=start_ts_ns)
-        logger.info(
-            "[PdProxy] request=%s accepted path=%s ts_ns=%d",
-            req.request_id,
-            path,
-            start_ts_ns,
-        )
+        try:
+            logger.info(
+                "[PdProxy] request=%s accepted path=%s ts_ns=%d",
+                req.request_id,
+                path,
+                start_ts_ns,
+            )
 
-        decode_status, decode_body, decode_content_type = _post_json(
-            self.config.decode_url + path,
-            req.decode_body,
-            self.config.timeout_s,
-            req.request_id,
-            "D",
-        )
-        logger.info(
-            "[PdProxy] request=%s D completed status=%s bytes=%d latency_ms=%.3f ts_ns=%d",
-            req.request_id,
-            decode_status,
-            len(decode_body),
-            (end_ts_ns := time.time_ns() - start_ts_ns) / 1_000_000,
-            start_ts_ns + end_ts_ns,
-        )
-        return decode_status, decode_body, decode_content_type
+            decode_status, decode_body, decode_content_type = _post_json(
+                req.decode_url + path,
+                req.decode_body,
+                self.config.timeout_s,
+                req.request_id,
+                "D",
+            )
+            end_ts_ns = time.time_ns()
+            self.config.metrics.finish_request(
+                (end_ts_ns - start_ts_ns) / 1_000_000_000,
+                error=decode_status >= 400,
+            )
+            logger.info(
+                "[PdProxy] request=%s D completed status=%s bytes=%d latency_ms=%.3f ts_ns=%d",
+                req.request_id,
+                decode_status,
+                len(decode_body),
+                (end_ts_ns - start_ts_ns) / 1_000_000,
+                end_ts_ns,
+            )
+            return decode_status, decode_body, decode_content_type
+        except Exception:
+            self.config.metrics.finish_request(error=True)
+            raise
 
     def open_openai_stream(self, path: str, body: dict[str, Any]):
         if path not in SUPPORTED_PATHS:
@@ -114,11 +300,12 @@ class PdProxy:
                 "application/json",
                 None,
                 "",
-                time.time_ns(),
+                0,
                 json.dumps(payload).encode(),
             )
 
         start_ts_ns = time.time_ns()
+        self.config.metrics.start_request(stream=True)
         req = build_pd_proxy_request(body, self.config, proxy_start_ts_ns=start_ts_ns)
         req.decode_body["stream"] = True
         logger.info(
@@ -127,28 +314,33 @@ class PdProxy:
             path,
             start_ts_ns,
         )
-        response = _open_json(
-            self.config.decode_url + path,
-            req.decode_body,
-            self.config.timeout_s,
-            req.request_id,
-            "D",
-        )
-        logger.info(
-            "[PdProxy] request=%s D stream headers status=%s latency_ms=%.3f ts_ns=%d",
-            req.request_id,
-            int(response.status),
-            (header_delta_ns := time.time_ns() - start_ts_ns) / 1_000_000,
-            start_ts_ns + header_delta_ns,
-        )
-        return (
-            int(response.status),
-            response.headers.get("Content-Type", "text/event-stream"),
-            response,
-            req.request_id,
-            start_ts_ns,
-            None,
-        )
+        try:
+            response = _open_json(
+                req.decode_url + path,
+                req.decode_body,
+                self.config.timeout_s,
+                req.request_id,
+                "D",
+            )
+            header_ts_ns = time.time_ns()
+            logger.info(
+                "[PdProxy] request=%s D stream headers status=%s latency_ms=%.3f ts_ns=%d",
+                req.request_id,
+                int(response.status),
+                (header_ts_ns - start_ts_ns) / 1_000_000,
+                header_ts_ns,
+            )
+            return (
+                int(response.status),
+                response.headers.get("Content-Type", "text/event-stream"),
+                response,
+                req.request_id,
+                start_ts_ns,
+                None,
+            )
+        except Exception:
+            self.config.metrics.finish_request(error=True)
+            raise
 
     def close(self) -> None:
         return None
@@ -195,7 +387,12 @@ def _post_json(
         )
         return int(exc.code), response_body, exc.headers.get("Content-Type", "application/json")
     except URLError:
-        logger.exception("[PdProxy] request=%s %s connection failed url=%s", request_id, role, url)
+        logger.exception(
+            "[PdProxy] request=%s %s connection failed url=%s",
+            request_id,
+            role,
+            url,
+        )
         raise
 
 
@@ -226,12 +423,47 @@ def _open_json(
     except HTTPError:
         raise
     except URLError:
-        logger.exception("[PdProxy] request=%s %s connection failed url=%s", request_id, role, url)
+        logger.exception(
+            "[PdProxy] request=%s %s connection failed url=%s",
+            request_id,
+            role,
+            url,
+        )
         raise
+
+
+def iter_http_stream_chunks(response) -> Any:
+    pending = bytearray()
+    while True:
+        line = response.readline()
+        if not line:
+            if pending:
+                yield bytes(pending)
+            return
+        pending.extend(line)
+        if line in {b"\n", b"\r\n"}:
+            yield bytes(pending)
+            pending.clear()
 
 
 class _Handler(BaseHTTPRequestHandler):
     server: _PdHttpServer
+
+    def do_GET(self) -> None:
+        if self.path != "/metrics":
+            payload = b"not found\n"
+            self.send_response(HTTPStatus.NOT_FOUND)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+        payload = render_proxy_metrics(self.server.proxy.config)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/plain; version=0.0.4")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
     def do_POST(self) -> None:
         content_length = int(self.headers.get("Content-Length", "0"))
@@ -259,22 +491,38 @@ class _Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 if payload is not None:
                     self.wfile.write(payload)
+                    if start_ts_ns > 0:
+                        self.server.proxy.config.metrics.finish_request(
+                            (time.time_ns() - start_ts_ns) / 1_000_000_000,
+                            error=int(status) >= 400,
+                        )
                     return
-                with response:
-                    first_chunk = True
-                    while chunk := response.read(65536):
-                        if first_chunk:
-                            first_chunk = False
-                            now_ns = time.time_ns()
-                            logger.info(
-                                "[PdProxy] request=%s first stream chunk bytes=%d ttft_ms=%.3f ts_ns=%d",
-                                request_id,
-                                len(chunk),
-                                (now_ns - start_ts_ns) / 1_000_000,
-                                now_ns,
-                            )
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
+                try:
+                    with response:
+                        first_chunk = True
+                        for chunk in iter_http_stream_chunks(response):
+                            self.server.proxy.config.metrics.record_stream_chunk(len(chunk))
+                            if first_chunk:
+                                first_chunk = False
+                                now_ns = time.time_ns()
+                                self.server.proxy.config.metrics.record_first_chunk(
+                                    (now_ns - start_ts_ns) / 1_000_000_000
+                                )
+                                logger.info(
+                                    "[PdProxy] request=%s first stream chunk bytes=%d ttft_ms=%.3f ts_ns=%d",
+                                    request_id,
+                                    len(chunk),
+                                    (now_ns - start_ts_ns) / 1_000_000,
+                                    now_ns,
+                                )
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
+                    stream_duration_s = (time.time_ns() - start_ts_ns) / 1_000_000_000
+                    self.server.proxy.config.metrics.record_stream_duration(stream_duration_s)
+                    self.server.proxy.config.metrics.finish_request(stream_duration_s)
+                except Exception:
+                    self.server.proxy.config.metrics.finish_request(error=True)
+                    raise
                 return
             status, payload, content_type = self.server.proxy.handle_openai_request(
                 self.path,
@@ -306,12 +554,44 @@ class _PdHttpServer(ThreadingHTTPServer):
         self.proxy = proxy
 
 
+def parse_endpoint_urls(raw: str) -> tuple[str, ...]:
+    urls = tuple(url.strip().rstrip("/") for url in raw.split(",") if url.strip())
+    if not urls:
+        raise argparse.ArgumentTypeError("expected at least one endpoint URL")
+    return urls
+
+
+def build_router(
+    *,
+    prefill_urls: tuple[str, ...],
+    decode_urls: tuple[str, ...],
+    routing_policy: str,
+) -> RoundRobinPairRouter:
+    if routing_policy != "round_robin":
+        raise ValueError(f"unsupported routing policy {routing_policy!r}")
+    normalized_prefill_urls = tuple(url.rstrip("/") for url in prefill_urls)
+    normalized_decode_urls = tuple(url.rstrip("/") for url in decode_urls)
+    return RoundRobinPairRouter(
+        prefill_endpoints=tuple(
+            PdEndpoint(url=url, instance_id=f"p{index}")
+            for index, url in enumerate(normalized_prefill_urls)
+        ),
+        decode_endpoints=tuple(
+            PdEndpoint(url=url, instance_id=f"d{index}")
+            for index, url in enumerate(normalized_decode_urls)
+        ),
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="PegaFlow P/D local proxy")
     parser.add_argument("--listen-host", default="127.0.0.1")
     parser.add_argument("--listen-port", type=int, default=8100)
     parser.add_argument("--prefill-url", default="http://127.0.0.1:8001")
     parser.add_argument("--decode-url", default="http://127.0.0.1:8002")
+    parser.add_argument("--prefill-urls", type=parse_endpoint_urls)
+    parser.add_argument("--decode-urls", type=parse_endpoint_urls)
+    parser.add_argument("--routing-policy", choices=["round_robin"], default="round_robin")
     parser.add_argument("--timeout-s", type=float, default=600.0)
     parser.add_argument("--prefill-max-tokens", type=int, default=1)
     parser.add_argument("--log-file")
@@ -326,20 +606,29 @@ def main(argv: list[str] | None = None) -> None:
         handlers=handlers,
     )
 
+    prefill_urls = args.prefill_urls or (args.prefill_url.rstrip("/"),)
+    decode_urls = args.decode_urls or (args.decode_url.rstrip("/"),)
+    router = build_router(
+        prefill_urls=prefill_urls,
+        decode_urls=decode_urls,
+        routing_policy=args.routing_policy,
+    )
     config = ProxyConfig(
-        prefill_url=args.prefill_url.rstrip("/"),
-        decode_url=args.decode_url.rstrip("/"),
+        prefill_url=prefill_urls[0],
+        decode_url=decode_urls[0],
         timeout_s=args.timeout_s,
         prefill_max_tokens=args.prefill_max_tokens,
+        router=router,
     )
     proxy = PdProxy(config)
     server = _PdHttpServer((args.listen_host, args.listen_port), proxy)
     logger.info(
-        "[PdProxy] listening http://%s:%d prefill=%s decode=%s",
+        "[PdProxy] listening http://%s:%d policy=%s prefill=%s decode=%s",
         args.listen_host,
         args.listen_port,
-        config.prefill_url,
-        config.decode_url,
+        args.routing_policy,
+        list(prefill_urls),
+        list(decode_urls),
     )
     try:
         server.serve_forever()
